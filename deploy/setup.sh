@@ -196,6 +196,9 @@ systemctl enable --now hiby-hub.service
 systemctl enable --now hiby-backup.timer
 
 if [ -n "${TUNNEL_TOKEN:-}" ]; then
+  # Accept the whole "cloudflared.exe service install <token>" line the
+  # dashboard's copy button gives you: keep just the token.
+  TUNNEL_TOKEN="$(printf '%s' "$TUNNEL_TOKEN" | tr -d '\r' | awk '{print $NF}')"
   say "Connecting the Cloudflare Tunnel"
   cloudflared service install "$TUNNEL_TOKEN" >/dev/null 2>&1 || warn "cloudflared service install reported a problem; check: systemctl status cloudflared"
 fi
