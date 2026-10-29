@@ -86,7 +86,10 @@ async function scanLibrary() {
   }
 
   const albums = [];
-  const topDirs = topEntries.filter(e => e.isDirectory());
+  // Skip hidden/system folders (.thumbnails, .Trash, $RECYCLE.BIN, …) and the
+  // Playlists folder, which holds .m3u8 files rather than an album.
+  const isJunkDir = n => n.startsWith('.') || n.startsWith('$') || /^(playlists|system volume information)$/i.test(n);
+  const topDirs = topEntries.filter(e => e.isDirectory() && !isJunkDir(e.name));
 
   // Process up to 4 top-level folders concurrently.
   await mapLimit(topDirs, 4, async top => {
@@ -94,7 +97,7 @@ async function scanLibrary() {
     const children = await readDirEntries(topPath);
     if (!children) return;
 
-    const subDirs  = children.filter(c => c.isDirectory());
+    const subDirs  = children.filter(c => c.isDirectory() && !isJunkDir(c.name));
     const hasAudio = children.some(c => c.isFile() && isAudioFile(c.name));
 
     if (hasAudio || subDirs.length === 0) {
@@ -113,7 +116,7 @@ async function scanLibrary() {
       const subChildren = await readDirEntries(subPath);
       if (!subChildren) return;
 
-      const subSubDirs  = subChildren.filter(c => c.isDirectory());
+      const subSubDirs  = subChildren.filter(c => c.isDirectory() && !isJunkDir(c.name));
       const subHasAudio = subChildren.some(c => c.isFile() && isAudioFile(c.name));
 
       if (subHasAudio || subSubDirs.length === 0) {
