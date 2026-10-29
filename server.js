@@ -50,6 +50,9 @@ app.use(basicAuth);
 const wheelhouseRoute = require('./routes/wheelhouse');
 
 app.use(compression());
+// Wheelhouse posts large inventories, so it uses its own (4 MB) JSON parser
+// and is mounted before the app-wide 1 MB one.
+app.use('/api/wheelhouse', wheelhouseRoute);
 app.use(express.json({ limit: '1mb' }));
 
 // Ensure cache directory exists
@@ -119,7 +122,6 @@ app.use('/api/lastfm',     lastfmRoute);
 app.use('/api/smart-playlists', smartPlaylistRoute);
 app.use('/api/activity',        activityRoute);
 app.use('/api/settings',        settingsRoute);
-app.use('/api/wheelhouse',      wheelhouseRoute);
 // Convenience alias so /api/setup-status hits the same handler.
 app.get('/api/setup-status', (req, res, next) => {
   req.url = '/setup-status';

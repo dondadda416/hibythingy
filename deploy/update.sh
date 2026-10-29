@@ -9,6 +9,7 @@ BEFORE="$(git -C "$APP_DIR" rev-parse --short HEAD)"
 git -C "$APP_DIR" reset -q --hard "origin/$BRANCH"
 AFTER="$(git -C "$APP_DIR" rev-parse --short HEAD)"
 ( cd "$APP_DIR" && npm ci --omit=dev --no-audit --no-fund --loglevel=error )
+chown -R hiby:hiby "$APP_DIR"
 chmod +x "$APP_DIR"/deploy/*.sh
 systemctl restart hiby-hub
 echo "Updated $BEFORE -> $AFTER and restarted hiby-hub."

@@ -174,6 +174,12 @@ router.post('/queue/:id', (req, res) => {
     return res.status(400).json({ ok: false, error: "status must be 'running', 'done' or 'error'" });
   }
   if (item.status === 'cancelled') return res.json({ ok: true, cancelled: true });
+  // Only move forward: queued → running → done/error. A repeat of the current
+  // status (e.g. a retried "done" request) is acknowledged but not re-applied.
+  if (item.status === status) return res.json({ ok: true, unchanged: true });
+  if (item.status === 'done' || (item.status === 'error' && status !== 'running')) {
+    return res.status(409).json({ ok: false, error: `Already ${item.status}` });
+  }
 
   const error = status === 'error' ? String((req.body && req.body.error) || 'Failed on device').slice(0, 500) : null;
   db.setQueueStatus(id, status, error);

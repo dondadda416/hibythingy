@@ -25,6 +25,12 @@ function getTracksFromFolder(folderPath) {
   } catch (_) { return []; }
 }
 
+// A playlist name must be a plain file name inside Playlists/.
+function isSafePlaylistName(n) {
+  return typeof n === 'string' && n.length > 0 && n.length <= 200 &&
+    !/[\\/\0]/.test(n) && n !== '.' && n !== '..';
+}
+
 // Build relative path from Playlists dir to a track
 function relPath(trackPath) {
   return path.relative(PLAYLISTS_DIR, trackPath).replace(/\\/g, '/');
@@ -178,7 +184,7 @@ router.post('/generate-from-albums', (req, res) => {
     // Only accept folders that live inside the configured library root. The
     // album paths come from the library cache, but we re-check here so this
     // endpoint can never be coaxed into reading arbitrary filesystem folders.
-    const libRoot = path.resolve(config.LIBRARY_PATH).toLowerCase();
+    const { resolveUnder } = require('../lib/safePath');
 
     const safeName = name.replace(/[<>:"/\\|?*]/g, '_').slice(0, 80);
     const lines = ['#EXTM3U', `#PLAYLIST:${safeName}`];
@@ -189,8 +195,8 @@ router.post('/generate-from-albums', (req, res) => {
       const ap     = typeof entry === 'string' ? entry : (entry && entry.path);
       const artist = typeof entry === 'object' && entry ? entry.artist : '';
       if (!ap) continue;
-      const resolved = path.resolve(ap);
-      if (!resolved.toLowerCase().startsWith(libRoot)) continue;
+      const resolved = resolveUnder(ap, [config.LIBRARY_PATH]);
+      if (!resolved) continue;
 
       const tracks = getTracksFromFolder(resolved);
       if (tracks.length === 0) continue;
@@ -252,6 +258,7 @@ router.get('/list', (req, res) => {
 router.get('/inspect', (req, res) => {
   const name = (req.query.name || '').toString().replace(/\.(m3u8?|m3u)$/i, '');
   if (!name) return res.status(400).json({ error: 'name required' });
+  if (!isSafePlaylistName(name)) return res.status(400).json({ error: 'Invalid playlist name' });
   // Try .m3u8 first, fall back to .m3u for legacy generated files.
   let file = path.join(PLAYLISTS_DIR, `${name}.m3u8`);
   if (!fs.existsSync(file)) file = path.join(PLAYLISTS_DIR, `${name}.m3u`);
@@ -280,6 +287,7 @@ router.get('/inspect', (req, res) => {
 // DELETE /api/playlist/:name — delete a saved playlist (.m3u or .m3u8)
 router.delete('/:name', (req, res) => {
   const base = req.params.name.replace(/\.(m3u8?|m3u)$/i, '');
+  if (!isSafePlaylistName(base)) return res.status(400).json({ error: 'Invalid playlist name' });
   const m3u8 = path.join(PLAYLISTS_DIR, base + '.m3u8');
   const m3u  = path.join(PLAYLISTS_DIR, base + '.m3u');
   const file = fs.existsSync(m3u8) ? m3u8 : m3u;
@@ -297,7 +305,7 @@ router.post('/push', (req, res) => {
   if (!name) return res.status(400).json({ error: 'name required' });
 
   const base = String(name).replace(/\.(m3u8?|m3u)$/i, '');
-  if (/[\\/]|\.\./.test(base)) return res.status(400).json({ error: 'Invalid playlist name' });
+  if (!isSafePlaylistName(base)) return res.status(400).json({ error: 'Invalid playlist name' });
   const m3u8 = path.join(PLAYLISTS_DIR, base + '.m3u8');
   const m3u  = path.join(PLAYLISTS_DIR, base + '.m3u');
   const file = fs.existsSync(m3u8) ? m3u8 : m3u;

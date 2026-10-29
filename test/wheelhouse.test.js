@@ -134,6 +134,14 @@ describe('push → sync → done', () => {
     expect(again.body.skipped).toBe(true);
   });
 
+  it('ignores repeated or backwards status reports', async () => {
+    const again = await request(app).post(`/api/wheelhouse/queue/${jobId}`).set(auth).send({ status: 'done' }).expect(200);
+    expect(again.body.unchanged).toBe(true);
+    await request(app).post(`/api/wheelhouse/queue/${jobId}`).set(auth).send({ status: 'running' }).expect(409);
+    const pushes = db.getActivity(200).filter(e => e.action === 'pushed');
+    expect(pushes).toHaveLength(1);
+  });
+
   it('lets the dashboard cancel a queued item', async () => {
     const r = await request(app).post('/api/device/push')
       .send({ sourcePath: path.join(LIB, 'Daft Punk', 'Discovery'), artist: 'Daft Punk', album: 'Discovery', force: true }).expect(200);
@@ -170,6 +178,29 @@ describe('playlists and scans', () => {
     const dl = (await request(app).get('/api/playlist/device-list')).body;
     expect(dl.total).toBe(2);
     expect(dl.suggestedCount).toBe(1);
+  });
+
+  it('keeps the last scan time while a new scan is pending', async () => {
+    const before = (await request(app).get('/api/device/scan-status')).body.scannedAt;
+    await request(app).post('/api/device/scan').expect(200);
+    const during = (await request(app).get('/api/device/scan-status')).body;
+    expect(during.status).toBe('scanning');
+    expect(during.scannedAt).toBe(before);
+  });
+
+  it('refuses playlist names that escape Playlists/', async () => {
+    await request(app).get('/api/playlist/inspect').query({ name: '../Daft Punk/x' }).expect(400);
+    await request(app).delete('/api/playlist/..%2Fsecret').expect(400);
+    await request(app).post('/api/playlist/push').send({ name: '../../etc/x' }).expect(400);
+  });
+
+  it('accepts a large inventory (bigger than the app-wide 1 MB JSON limit)', async () => {
+    const albums = Array.from({ length: 12000 }, (_, i) => ({ artist: `Artist ${i} with a fairly long name`, album: `Album ${i} (Deluxe Remastered Edition)`, tracks: 12, sizeMB: 400, relPath: `Artist ${i}/Album ${i}` }));
+    const big = express();
+    big.use('/api/wheelhouse', require('../routes/wheelhouse'));
+    big.use(express.json({ limit: '1mb' }));
+    const r = await request(big).post('/api/wheelhouse/inventory').set(auth).send({ albums }).expect(200);
+    expect(r.body.albums).toBe(12000);
   });
 
   it('lets the R4 browse and request albums itself', async () => {

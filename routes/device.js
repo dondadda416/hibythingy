@@ -244,18 +244,6 @@ router.delete('/pushed', (req, res) => {
   }
 });
 
-// DELETE /api/device/pushed — clear the push log
-router.delete('/pushed', (req, res) => {
-  try {
-    const before = db.getPushLog().albumCount;
-    db.clearPushLog();
-    db.logActivity('system', 'push-log-cleared', null, { removed: before });
-    res.json({ ok: true, message: 'Push log cleared.' });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: 'Clear failed' });
-  }
-});
-
 // GET /api/device/detect — kept for the Devices tab's diagnostics button.
 router.get('/detect', async (req, res) => {
   const status = await getStatus();

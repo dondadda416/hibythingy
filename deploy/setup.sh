@@ -36,7 +36,7 @@ die()  { printf '\033[1;31mxx  %s\033[0m\n' "$*" >&2; exit 1; }
 ask() {   # ask VAR "Question" [default] [secret]
   local var="$1" q="$2" def="${3:-}" secret="${4:-}" val="${!1:-}"
   if [ -n "$val" ]; then return; fi
-  if [ ! -r /dev/tty ]; then
+  if ! { : < /dev/tty; } 2>/dev/null; then
     [ -n "$def" ] && { printf -v "$var" '%s' "$def"; return; }
     die "$var is required (no terminal to ask on)."
   fi
@@ -75,7 +75,8 @@ apt-get update -qq
 apt-get install -y -qq curl ca-certificates git fuse3 unzip openssl ufw >/dev/null
 apt-get install -y -qq rsgain >/dev/null 2>&1 || warn "rsgain not available — ReplayGain tagging will be off."
 
-if ! command -v node >/dev/null || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 22 ]; then
+# node:sqlite works without a flag from Node 22.13.
+if ! command -v node >/dev/null || ! node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>22||(a===22&&b>=13)?0:1)'; then
   say "Installing Node.js 22"
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null
   apt-get install -y -qq nodejs >/dev/null
@@ -132,6 +133,9 @@ else
   git clone -q -b "$REPO_BRANCH" "$REPO_URL" "$APP_DIR"
 fi
 ( cd "$APP_DIR" && npm ci --omit=dev --no-audit --no-fund --loglevel=error )
+# The Hub (running as hiby) rewrites .env from the Settings page, which needs
+# write access to the app folder.
+chown -R "$SVC_USER:$SVC_USER" "$APP_DIR"
 
 # ── .env ────────────────────────────────────────────────────────────────────
 say "Writing settings"
@@ -184,9 +188,10 @@ cp "$APP_DIR/deploy/systemd/hiby-backup.timer"   /etc/systemd/system/
 chmod +x "$APP_DIR/deploy/"*.sh
 systemctl daemon-reload
 systemctl enable --now hiby-library.service
-for _ in $(seq 1 20); do mountpoint -q "$SRV/library" && break; sleep 1; done
-mountpoint -q "$SRV/library" || die "The R2 mount didn't come up. See: journalctl -u hiby-library -n 50"
-echo "    Library mounted: $(ls "$SRV/library" | wc -l) top-level folders."
+# The mount belongs to hiby (no allow_other), so check it via findmnt/as hiby.
+for _ in $(seq 1 20); do findmnt -rn "$SRV/library" >/dev/null && break; sleep 1; done
+findmnt -rn "$SRV/library" >/dev/null || die "The R2 mount didn't come up. See: journalctl -u hiby-library -n 50"
+echo "    Library mounted: $(sudo -u "$SVC_USER" ls "$SRV/library" | wc -l) top-level folders."
 systemctl enable --now hiby-hub.service
 systemctl enable --now hiby-backup.timer
 
@@ -203,7 +208,9 @@ ufw --force enable >/dev/null
 say "Checking the Hub"
 ok=""
 for _ in $(seq 1 30); do
-  if curl -fsS http://127.0.0.1:3847/api/status >/dev/null 2>&1; then ok=1; break; fi
+  # Any HTTP answer (even 401 when Basic auth is on) means the Hub is up.
+  code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3847/api/status || true)"
+  if [ "$code" != "000" ] && [ -n "$code" ]; then ok=1; break; fi
   sleep 2
 done
 [ -n "$ok" ] || die "The Hub didn't answer on port 3847. See: journalctl -u hiby-hub -n 50"
