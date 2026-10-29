@@ -46,13 +46,18 @@ It asks for the Cloudflare account ID, the R2 key ID and secret, the bucket name
 
 ## 5. Cloudflare Access
 
-Keep your existing **HiBy Hub** Access application (email PIN) on `hiby.<your domain>`. Add one more application so the R4 can get through:
+Keep your existing **HiBy Hub** Access application (email PIN) on `hiby.<your domain>`. The R4 can't type a PIN, so it carries an Access **service token** instead:
 
-- **Zero Trust → Access → Applications → Add → Self-hosted**
-- Name: `HiBy Hub – Wheelhouse`, domain `hiby.<your domain>`, path `api/wheelhouse`
-- Policy: action **Bypass**, include **Everyone**
-
-The more specific path wins, so only `/api/wheelhouse/*` skips the PIN. Those requests still need the Wheelhouse token.
+1. **Zero Trust → Access → Service credentials → Service Tokens → Create**. Name it `hiby-r4` and pick a long duration. Copy the **Client ID** and **Client Secret** (the secret is only shown once).
+2. **Zero Trust → Access → Applications → Add → Self-hosted**: name `HiBy Hub – Wheelhouse`, domain `hiby.<your domain>`, path `api/wheelhouse`. Add a policy with action **Service Auth**, include **Service Token → hiby-r4**.
+   The more specific path wins, so only `/api/wheelhouse/*` accepts the token; the dashboard keeps its PIN. Those requests also still need the Wheelhouse token.
+3. On the server, add both values to `/opt/hiby-hub/.env` and restart:
+   ```
+   CF_ACCESS_CLIENT_ID=<client id>.access
+   CF_ACCESS_CLIENT_SECRET=<client secret>
+   ```
+   `sudo systemctl restart hiby-hub`
+4. Open `https://hiby.<your domain>/connect` (Device page → **Connect R4**), download `hub.txt`, copy it to the R4's `Download` folder, and in Wheelhouse choose Hub → Set up → **Load hub.txt From Card**.
 
 ## Day to day
 
@@ -79,5 +84,5 @@ sudo systemctl start hiby-hub
 
 - **"CORS: origin not allowed"**: `ALLOWED_ORIGINS` in `.env` must be exactly `https://hiby.<your domain>`.
 - **R4 gets 401**: the token in Wheelhouse doesn't match `WHEELHOUSE_TOKEN` in `.env`.
-- **R4 gets an HTML login page**: the Access Bypass application for `/api/wheelhouse` is missing.
+- **Wheelhouse says "Cloudflare blocked the R4"**: the `api/wheelhouse` Access application or its Service Auth policy is missing, or the service token in the setup code is wrong or expired. Check `CF_ACCESS_CLIENT_*` in `.env`, restart, and load a fresh `hub.txt`.
 - **Library looks empty**: run `journalctl -u hiby-library -n 50`. Most often the R2 key is wrong, or it doesn't have access to the bucket.

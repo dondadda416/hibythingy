@@ -140,18 +140,26 @@ Redirects to a signed R2 link for one file. When R2 isn't configured, it streams
 
 ## Wheelhouse 1.10 (the R4 side)
 
-Main menu → **Hub Sync**.
+Main menu → **Hub**.
 
-- **Load hub.txt** reads settings from `hub.txt` in `Download/` or `Wheelhouse/` on the player:
-  ```
-  server=https://hiby.jp-copeland.com
-  token=<WHEELHOUSE_TOKEN>
-  cf_id=<Access client id>
-  cf_secret=<Access client secret>
-  ```
-  Each field can also be typed in on the Hub Sync screen.
-- **Music Folder**: picked once with Android's folder picker (internal storage or SD card). Albums land at `<folder>/<relPath>`, so pick the folder that should hold `Artist/Album` folders and `Playlists/`.
-- **Auto Sync** checks the Hub every 10 minutes while the app is open on unmetered Wi-Fi. **Sync Now** runs it straight away.
-- **Get Albums** lists the Hub library; pressing an album queues it (`POST /request`).
-- Files download as `name.part`, are checked against the expected size, then renamed. Files already present with the right size are skipped, so an interrupted album resumes.
-- After a sync Wheelhouse sends `/inventory`, asks the media scanner to index the new files, and rescans its own library.
+**Setting up.** Open `/connect` on the Hub (Device page → **Connect R4**). It shows a setup code (`WH1:` + base64url JSON `{u, t, ci, cs}`: Hub address, Wheelhouse token, Access client id and secret) and offers it as `hub.txt`. On the R4: Hub → **Set up**, then either
+- **Load hub.txt From Card**: reads `hub.txt` from `Download/` or `Wheelhouse/` and deletes it after loading, or
+- **Paste Setup Code** from the clipboard.
+
+A hand-written `hub.txt` works too:
+```
+server=https://hiby.example.com
+token=<WHEELHOUSE_TOKEN>
+cf_id=<Access client id>
+cf_secret=<Access client secret>
+```
+
+**Hub screen**
+- **Sync Now / Stop**. Runs in a foreground service with a progress notification, holding Wi-Fi and wake locks, so the screen can turn off.
+- **Get Albums** lists the Hub library (✓ = already on the R4); picking one queues it (`POST /request`) and syncs.
+- **Auto Sync** (on by default) pings the Hub every 15 minutes on Wi-Fi while Wheelhouse is open and syncs when something is waiting.
+- **Allow Storage Access** asks for the storage permission Android needs to write to the SD card (on Android 11+, "All files access").
+- **Saving To**: the first writable `Music` folder on the SD card, else internal storage. Albums land at `Music/<relPath>`.
+- **Send Album List** posts `/inventory` straight away.
+
+Files download as `name.part` (resumed with a Range request after an interruption), are checked against the expected size, then renamed. Files already present at the right size are skipped. An expired R2 link (400/403) makes Wheelhouse ask `/sync` again for fresh links. A redirect or HTML answer means Cloudflare Access turned the R4 away; Wheelhouse reports "Cloudflare blocked the R4".

@@ -75,6 +75,15 @@ module.exports = {
   // /api/wheelhouse/* is refused when this is blank.
   WHEELHOUSE_TOKEN: envOrEmpty('WHEELHOUSE_TOKEN'),
 
+  // Cloudflare Access service token the R4 sends with every call (Zero Trust →
+  // Access → Service credentials). Only used to build the setup code on /connect.
+  CF_ACCESS_CLIENT_ID:     envOrEmpty('CF_ACCESS_CLIENT_ID'),
+  CF_ACCESS_CLIENT_SECRET: envOrEmpty('CF_ACCESS_CLIENT_SECRET'),
+
+  // Public address of the Hub, e.g. https://hiby.example.com. Defaults to the
+  // first ALLOWED_ORIGINS entry, then to the address the browser used.
+  PUBLIC_URL: envOrEmpty('HUB_PUBLIC_URL').replace(/\/+$/, ''),
+
   // Minutes since Wheelhouse last checked in before the R4 shows as offline.
   WHEELHOUSE_ONLINE_MINUTES: envInt('WHEELHOUSE_ONLINE_MINUTES', 10),
 

@@ -122,6 +122,7 @@ app.use('/api/lastfm',     lastfmRoute);
 app.use('/api/smart-playlists', smartPlaylistRoute);
 app.use('/api/activity',        activityRoute);
 app.use('/api/settings',        settingsRoute);
+app.use('/connect',             require('./routes/connect'));
 // Convenience alias so /api/setup-status hits the same handler.
 app.get('/api/setup-status', (req, res, next) => {
   req.url = '/setup-status';
