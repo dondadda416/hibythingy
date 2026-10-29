@@ -1,145 +1,83 @@
-# Deploying HiBy Hub behind a Cloudflare Tunnel
+# Running HiBy Hub in the cloud
 
-This guide makes Hub reachable from anywhere (your phone, a friend's laptop, a hotel) without exposing it directly to the internet. Your PC stays the host — Hub still needs your D: drive, your Soulseek inbox, and your USB-connected R4 — but **cloudflared** opens a private tunnel from Cloudflare's edge to `localhost:3847`, and **Cloudflare Access** sits in front to gate it with one-time-PIN email auth.
+```
+ you (any browser) ──► Cloudflare Access ──► Tunnel ──► small server: HiBy Hub (127.0.0.1:3847)
+                                                              │  rclone mount
+                                                              ▼
+ HiBy R4 (Wheelhouse) ──► /api/wheelhouse (token) ──► signed links ──► Cloudflare R2: hiby-library/library/…
+```
 
-Cost: **$0** for personal use. Cloudflare's free plan covers the tunnel, the DNS, and Access for up to 50 users.
+- **Library**: the R2 bucket `hiby-library`, under the `library/` prefix. The server mounts it at `/srv/hiby/library` with rclone, so the Hub treats it like a normal folder. Recently used files are cached on the server's disk (up to 15 GB).
+- **Inbox**: `/srv/hiby/inbox` on the server's disk. You fill it by dragging folders onto the Home page, or with **Choose folder… / Choose files…** on a phone. Files over 95 MB are skipped because Cloudflare limits uploads to 100 MB each.
+- **Database**: `/srv/hiby/data/hub.db`. It's backed up every night to `hiby-library/backups/` and kept for 30 days.
+- **R4**: Wheelhouse pulls queued albums and playlists over Wi-Fi. See [WHEELHOUSE_SYNC.md](WHEELHOUSE_SYNC.md).
 
----
+## 1. Server
 
-## What you need
+Any Ubuntu 24.04 VPS with 2 GB+ RAM and 40 GB+ disk works. Nothing needs to be close to you: the R4 downloads straight from R2, and the server only handles the dashboard and uploads.
 
-- Your home PC running Hub (the one that talks to the R4).
-- A domain on Cloudflare (free tier is fine; transfer one in, or buy one for ~$10/year).
-- Five minutes.
+## 2. Cloudflare Tunnel
 
----
+In Cloudflare **Zero Trust → Networks → Tunnels**:
 
-## 1. Install `cloudflared` on the host PC
+1. **Create a tunnel** → Cloudflared → name it `hiby-hub-cloud`. Copy the **token** from the install command (the long string after `--token`). Don't run the command shown there; the setup script installs it.
+2. **Public hostname**: `hiby.<your domain>` → service `HTTP` → `localhost:3847`.
+   If the hostname is still pointed at an old tunnel, delete that DNS record (or the old tunnel's public hostname) first.
 
-Download the Windows installer from <https://github.com/cloudflare/cloudflared/releases> (file is `cloudflared-windows-amd64.msi`) and run it. After install, open a new PowerShell terminal (so the new `PATH` is loaded) and verify:
+## 3. (Optional) bring the old database over
+
+This keeps favourites, the push log, smart playlists and activity history. On the old PC, close the Hub, then:
 
 ```powershell
-cloudflared --version
+rclone copy "C:\Users\user\Documents\Claude\Projects\HIby Project\cache" r2:hiby-library/migrate --include "hub.db*"
 ```
 
-## 2. Log in to your Cloudflare account
+The setup script imports it on first run.
 
-```powershell
-cloudflared tunnel login
+## 4. Run the setup
+
+SSH into the server, then:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dondadda416/hibythingy/cloud/deploy/setup.sh | sudo bash
 ```
 
-A browser tab opens. Pick the domain you want to use; Cloudflare drops a certificate at `C:\Users\<you>\.cloudflared\cert.pem`.
+It asks for the Cloudflare account ID, the R2 key ID and secret, the bucket name, the web address and the tunnel token. It then installs Node 22, rclone and cloudflared, mounts the library, starts everything, and prints the **Wheelhouse token**.
 
-## 3. Create the tunnel
+## 5. Cloudflare Access
 
-```powershell
-cloudflared tunnel create hiby-hub
+Keep your existing **HiBy Hub** Access application (email PIN) on `hiby.<your domain>`. Add one more application so the R4 can get through:
+
+- **Zero Trust → Access → Applications → Add → Self-hosted**
+- Name: `HiBy Hub – Wheelhouse`, domain `hiby.<your domain>`, path `api/wheelhouse`
+- Policy: action **Bypass**, include **Everyone**
+
+The more specific path wins, so only `/api/wheelhouse/*` skips the PIN. Those requests still need the Wheelhouse token.
+
+## Day to day
+
+| Task | Command |
+|---|---|
+| Live log | `sudo journalctl -u hiby-hub -f` |
+| Restart after editing `/opt/hiby-hub/.env` | `sudo systemctl restart hiby-hub` |
+| Update to the latest code | `sudo /opt/hiby-hub/deploy/update.sh` |
+| Check the R2 mount | `systemctl status hiby-library` |
+| Run a backup now | `sudo systemctl start hiby-backup` |
+
+**Restore a backup**
+
+```bash
+sudo systemctl stop hiby-hub
+sudo -u hiby rclone --config /etc/rclone/hiby.conf copyto r2:hiby-library/backups/hub-YYYY-MM-DD.db /srv/hiby/data/hub.db
+sudo rm -f /srv/hiby/data/hub.db-wal /srv/hiby/data/hub.db-shm
+sudo systemctl start hiby-hub
 ```
 
-This prints a tunnel UUID and writes a credentials JSON to `C:\Users\<you>\.cloudflared\<UUID>.json`. Note the UUID; you'll need it next.
-
-## 4. Configure the tunnel
-
-Create `C:\Users\<you>\.cloudflared\config.yml` (replace `<UUID>` and `<your-host>`):
-
-```yaml
-tunnel: <UUID>
-credentials-file: C:\Users\<you>\.cloudflared\<UUID>.json
-
-ingress:
-  - hostname: <your-host>          # e.g. hiby.example.com
-    service: http://localhost:3847
-    originRequest:
-      noTLSVerify: true            # Hub runs plain HTTP on localhost; tunnel encrypts the outer leg
-      connectTimeout: 10s
-  # Catch-all rule required by cloudflared
-  - service: http_status:404
-```
-
-## 5. Route DNS at your host
-
-```powershell
-cloudflared tunnel route dns hiby-hub <your-host>
-```
-
-This creates a `CNAME` in your Cloudflare DNS pointing at the tunnel. Propagation is instant.
-
-## 6. Install as a Windows service so it survives reboots
-
-```powershell
-cloudflared service install
-```
-
-That registers `cloudflared` as a Windows service running under `LOCAL SYSTEM`. To verify it's running:
-
-```powershell
-Get-Service cloudflared
-```
-
-You should see `Status: Running`.
-
-## 7. Lock the front door with Cloudflare Access
-
-By default, anyone on the internet who knows the hostname can hit your Hub. Add Access to gate it.
-
-1. In your Cloudflare dashboard, go to **Zero Trust → Access → Applications → Add an application → Self-hosted**.
-2. **Application name**: `HiBy Hub`. **Domain**: `<your-host>`. Session duration: whatever you want (24h is fine).
-3. **Add policy**: name it `Owner`, action `Allow`, include rule **Emails** → your email address. Save.
-4. The next time you hit `https://<your-host>` from a fresh browser, Cloudflare asks for your email and emails you a one-time PIN.
-
-That's it. Hub is now reachable from anywhere, and only signed-in users get past Cloudflare's edge.
-
----
-
-## 8. Tell Hub it's behind a proxy
-
-Open **Settings → Remote access** in Hub (or edit `.env` directly):
-
-```ini
-HUB_TRUST_PROXY=true
-ALLOWED_ORIGINS=https://<your-host>
-```
-
-Optional belt-and-braces password (in case Cloudflare Access is ever bypassed):
-
-```ini
-BASIC_AUTH_USER=your-name
-BASIC_AUTH_PASS=a-long-random-string
-```
-
-Hub's basic-auth gate skips `/api/coverart/serve` and `/api/tags/preview` so `<img>` and `<audio>` tags keep working without manual headers.
-
-Restart the server (`Ctrl+C`, `npm start`). The boot banner now reads:
-
-```
-  Proxy:     enabled (X-Forwarded-* trusted from loopback)
-  Auth:      Basic — user "your-name"
-  Origins:   localhost + https://<your-host>
-```
-
----
+**Adding music outside the Hub.** Anything copied straight into the bucket (for example `rclone copy … r2:hiby-library/library` from a PC) appears within 30 minutes, when the mount's folder cache refreshes. For an immediate refresh, run `sudo systemctl restart hiby-library hiby-hub`.
 
 ## Troubleshooting
 
-**"CORS: origin not allowed"** in the browser console
-→ `ALLOWED_ORIGINS` is missing your tunnel hostname. Add it in Settings → Remote access, restart.
-
-**Rate-limit returns 429 for every request from outside**
-→ `HUB_TRUST_PROXY` is off, so every request looks like it came from `127.0.0.1` and shares the same bucket. Flip it on.
-
-**Cloudflare Access loop**
-→ Your domain isn't fully proxied through Cloudflare. In Cloudflare DNS, the CNAME for `<your-host>` must have the orange cloud icon enabled.
-
-**`cloudflared` service won't start**
-→ Open `Event Viewer → Windows Logs → Application` and filter on Source `cloudflared`. The most common cause is the credentials JSON path being wrong in `config.yml` — Windows is picky about backslashes.
-
-**Hub serves but device push fails over the tunnel**
-→ The tunnel only fronts the HTTP server. Device push runs PowerShell on the host PC, which is fine — it doesn't care where the request came from.
-
----
-
-## Alternative: Tailscale
-
-If a custom domain feels like overkill, Tailscale gives you the same "reachable from anywhere" with one installer and no DNS. Install Tailscale on the host PC and on whatever you're using to reach Hub. Then `http://<machine-name>:3847` works from any device on your tailnet. Skip Access; Tailscale already authenticates you.
-
-Trade-off: no public URL to share, and the listening device has to be on Tailscale too.
+- **"CORS: origin not allowed"**: `ALLOWED_ORIGINS` in `.env` must be exactly `https://hiby.<your domain>`.
+- **R4 gets 401**: the token in Wheelhouse doesn't match `WHEELHOUSE_TOKEN` in `.env`.
+- **R4 gets an HTML login page**: the Access Bypass application for `/api/wheelhouse` is missing.
+- **Library looks empty**: run `journalctl -u hiby-library -n 50`. Most often the R2 key is wrong, or it doesn't have access to the bucket.

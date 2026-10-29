@@ -60,6 +60,8 @@ module.exports = {
     ACCESS_KEY_ID:     envOrEmpty('R2_ACCESS_KEY_ID'),
     SECRET_ACCESS_KEY: envOrEmpty('R2_SECRET_ACCESS_KEY'),
     BUCKET:            envOrEmpty('R2_BUCKET') || 'hiby-library',
+    // Optional override, e.g. for testing against another S3-compatible store.
+    ENDPOINT:          envOrEmpty('R2_ENDPOINT'),
     // Object-key prefix that LIBRARY_PATH maps onto (no leading slash).
     LIBRARY_PREFIX:    (envOrEmpty('R2_LIBRARY_PREFIX') || 'library').replace(/^\/+|\/+$/g, ''),
     // Lifetime of download links handed to the R4, in seconds.

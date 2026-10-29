@@ -1,0 +1,20 @@
+[Unit]
+Description=HiBy Hub
+Requires=hiby-library.service
+After=hiby-library.service network-online.target
+
+[Service]
+Type=simple
+User=hiby
+Group=hiby
+WorkingDirectory=/opt/hiby-hub
+Environment=NODE_ENV=production
+Environment=NODE_NO_WARNINGS=1
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+# Uploads + the rclone cache can be large; keep the Hub's own footprint small.
+MemoryMax=1500M
+
+[Install]
+WantedBy=multi-user.target

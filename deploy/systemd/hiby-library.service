@@ -1,0 +1,29 @@
+# The music library: r2:<bucket>/library mounted at /srv/hiby/library.
+# Files written here (albums moved in from the inbox, tag edits, cover art,
+# playlists) are cached on local disk and uploaded to R2 a few seconds later.
+[Unit]
+Description=HiBy Hub library (rclone mount of R2)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+User=hiby
+Group=hiby
+ExecStart=/usr/bin/rclone mount r2:@BUCKET@/library /srv/hiby/library \
+  --config /etc/rclone/hiby.conf \
+  --vfs-cache-mode full \
+  --vfs-cache-max-size 15G \
+  --vfs-cache-max-age 168h \
+  --vfs-write-back 10s \
+  --cache-dir /srv/hiby/vfs-cache \
+  --dir-cache-time 30m \
+  --attr-timeout 1m \
+  --umask 002 \
+  --log-level NOTICE
+ExecStop=/bin/fusermount3 -uz /srv/hiby/library
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=HiBy Hub database backup to R2
+
+[Service]
+Type=oneshot
+User=hiby
+Group=hiby
+Environment=R2_BUCKET=@BUCKET@
+ExecStart=/opt/hiby-hub/deploy/backup.sh
