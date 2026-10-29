@@ -378,39 +378,64 @@ router.get('/precheck', async (req, res) => {
 // Headers:
 //   X-Rel-Path: <root-folder>/<sub>/<file>   (forward slashes, validated)
 //   Content-Type: application/octet-stream
-// Body: raw file bytes (cap: 200 MB per file)
+// Body: raw file bytes (Cloudflare caps requests at 100 MB on the free plan)
 
+// Cloudflare's free plan refuses request bodies over 100 MB, so uploads that
+// come through the tunnel are capped there anyway; the server-side cap is a
+// backstop. Files are streamed to disk instead of buffered in memory.
 const RAW_LIMIT_BYTES = 200 * 1024 * 1024;
-const rawBody = express.raw({ type: '*/*', limit: RAW_LIMIT_BYTES });
 
-router.post('/import-file', rawBody, async (req, res) => {
+router.post('/import-file', async (req, res) => {
   const relPath = String(req.get('X-Rel-Path') || '').trim();
   if (!relPath) return res.status(400).json({ error: 'Missing X-Rel-Path header' });
 
   // Validate the rel-path: forward slashes only, no leading slash, no '..',
   // no null bytes, no Windows-illegal characters.
   if (/[\\\0]/.test(relPath))     return res.status(400).json({ error: 'Invalid path' });
-  if (relPath.includes('..'))     return res.status(400).json({ error: 'Path traversal rejected' });
+  if (relPath.split('/').includes('..')) return res.status(400).json({ error: 'Path traversal rejected' });
   if (relPath.startsWith('/'))    return res.status(400).json({ error: 'Path must be relative' });
   if (/[<>:"|?*]/.test(relPath))  return res.status(400).json({ error: 'Path contains illegal characters' });
   if (relPath.length > 1024)      return res.status(400).json({ error: 'Path too long' });
+
+  const declared = parseInt(req.get('Content-Length') || '', 10);
+  if (Number.isFinite(declared) && declared > RAW_LIMIT_BYTES) {
+    return res.status(413).json({ error: 'File too large' });
+  }
 
   // Build target absolute path under INBOX_PATH, then verify the resolved
   // path is still under INBOX_PATH (defence-in-depth against creative inputs).
   const inboxRoot = path.resolve(config.INBOX_PATH);
   const target = path.resolve(inboxRoot, relPath.replace(/\//g, path.sep));
-  if (!target.startsWith(inboxRoot + path.sep) && target !== inboxRoot) {
+  if (!target.startsWith(inboxRoot + path.sep)) {
     return res.status(400).json({ error: 'Resolved path is outside inbox' });
   }
 
-  // Ensure parent folder exists, then write the file.
+  const tmp = target + '.part-' + process.pid + '-' + Date.now();
   try {
     await fs.promises.mkdir(path.dirname(target), { recursive: true });
-    await fs.promises.writeFile(target, req.body);
-    res.json({ ok: true, path: target, bytes: req.body.length });
+    let bytes = 0;
+    const out = fs.createWriteStream(tmp);
+    await new Promise((resolve, reject) => {
+      req.on('data', chunk => {
+        bytes += chunk.length;
+        if (bytes > RAW_LIMIT_BYTES) {
+          const err = new Error('File too large'); err.status = 413;
+          req.unpipe(out); out.destroy(); reject(err);
+        }
+      });
+      req.on('aborted', () => reject(new Error('Upload aborted')));
+      req.on('error', reject);
+      out.on('error', reject);
+      out.on('finish', resolve);
+      req.pipe(out);
+    });
+    await fs.promises.rename(tmp, target);
+    res.json({ ok: true, path: target, bytes });
   } catch (e) {
+    try { await fs.promises.unlink(tmp); } catch (_) {}
+    if (e.status === 413) return res.status(413).json({ error: 'File too large' });
     console.error('[inbox/import-file]', e.message);
-    res.status(500).json({ error: 'Write failed' });
+    if (!res.headersSent) res.status(500).json({ error: 'Write failed' });
   }
 });
 

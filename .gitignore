@@ -1,10 +1,6 @@
 # Dependencies
 node_modules/
 
-# Personal config — contains local file paths
-# Copy config.example.js → config.js and fill in your values
-config.js
-
 # Secrets — copy .env.example → .env and fill in your API keys
 .env
 .env.local

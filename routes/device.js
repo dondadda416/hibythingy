@@ -1,7 +1,14 @@
-// ── Device route — HiBy R4 via Windows MTP (PowerShell Shell.Application) ────
+// ── Device route — HiBy R4 via Wheelhouse (Wi-Fi) ───────────────────────────
+// Hub no longer talks to the R4 over USB. Instead:
+//   - "Push to HiBy" adds the album to a download queue (db.device_queue).
+//   - Wheelhouse on the R4 checks in over Wi-Fi (routes/wheelhouse.js),
+//     downloads queued albums straight from R2, and reports each one done.
+//   - "Scan device" asks Wheelhouse to send its album list on its next check-in.
+// The response shapes below match what the old USB endpoints returned, so the
+// dashboard keeps working; jobs simply sit at "queued" until the R4 syncs.
+'use strict';
 const express = require('express');
 const router  = express.Router();
-const { exec, spawn } = require('child_process');
 const fs      = require('fs');
 const path    = require('path');
 const config  = require('../config');
@@ -10,80 +17,35 @@ const normalise = require('../lib/normalise');
 const { resolveUnder }        = require('../lib/safePath');
 const { validateBody }        = require('../lib/validate');
 const { DevicePushBody, DevicePushBatchBody } = require('../lib/schemas');
-const { requireWindows }      = require('../lib/platform');
 const db                      = require('../lib/db');
+const r2                      = require('../lib/r2');
+const { isAudioFile }         = require('../lib/walk');
 
-// Every PowerShell-backed endpoint in this router needs Windows. Apply the
-// gate at the router level so non-Windows hosts get a clean 503 with a hint
-// instead of a cryptic ENOENT for `powershell.exe`.
-router.use(requireWindows('Device control'));
-
-const CACHE_FILE    = path.join(config.CACHE_DIR, 'device.json');
-const PUSHED_FILE   = path.join(config.CACHE_DIR, 'pushed.json');
-const SCRIPTS_DIR   = path.join(__dirname, '..', 'scripts');
-
-// ── Timeouts ────────────────────────────────────────────────────────────────
-// Generous on purpose — PowerShell startup alone is ~1s and MTP transfers
-// over USB can be slow on a busy device. These are upper bounds; the script
-// usually finishes long before.
-const PS_CMD_TIMEOUT_MS    = 15_000;   // 15s   — quick inline PS commands (status check)
-const PS_SCRIPT_TIMEOUT_MS = 120_000;  // 2 min — running a .ps1 file
-const SCAN_TIMEOUT_MS      = 600_000;  // 10 min — full MTP namespace walk
-const PUSH_JOB_TIMEOUT_MS  = 360_000;  // 6 min  — single album push
-const BATCH_PUSH_TIMEOUT_MS = 480_000; // 8 min  — per album in a batch
-const PUSH_POLL_INTERVAL_MS = 5_000;   // 5s     — UI poll cadence during push
-
-// Run a PowerShell command string, return stdout as string
-function runPS(command, timeoutMs = PS_CMD_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    // -NonInteractive prevents prompts; -NoProfile speeds startup
-    const cmd = `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${command.replace(/"/g, '\\"')}"`;
-    exec(cmd, { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
-      if (err) return reject(new Error((stderr || err.message).trim()));
-      resolve(stdout.trim());
-    });
-  });
-}
-
-// Run a PowerShell script file, return stdout
-function runPSFile(scriptPath, timeoutMs = PS_SCRIPT_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    const cmd = `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
-    exec(cmd, { timeout: timeoutMs, windowsHide: true, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error((stderr || err.message).trim()));
-      resolve(stdout.trim());
-    });
-  });
-}
-
-// Quick check: is the device connected? Uses WPD device class (fast, <1s).
+// Is the R4 "connected"? Now means: Wheelhouse checked in recently.
 async function getStatus() {
-  try {
-    // List ALL WPD devices — filter client-side so escaping is simple
-    const ps = `Get-PnpDevice -Class WPD -Status OK -ErrorAction SilentlyContinue | Select-Object FriendlyName,InstanceId | ConvertTo-Json -Compress`;
-    const result = await runPS(ps);
-    if (!result || result === 'null') return { connected: false };
-
-    let devs;
-    try {
-      devs = JSON.parse(result);
-      // PowerShell returns a single object (not array) when there's only one device
-      if (!Array.isArray(devs)) devs = [devs];
-    } catch (_) {
-      return { connected: false };
-    }
-
-    if (devs.length === 0) return { connected: false };
-
-    // Only match devices that look like the target DAP — never fall back to random USB drives
-    const namePattern = new RegExp(`${config.DEVICE_NAME}|HiBy|R[0-9]`, 'i');
-    const dev = devs.find(d => d.FriendlyName && namePattern.test(d.FriendlyName));
-
-    if (!dev) return { connected: false, available: devs.map(d => d.FriendlyName).join(', ') };
-    return { connected: true, name: dev.FriendlyName || config.DEVICE_NAME, instanceId: dev.InstanceId || '' };
-  } catch (e) {
-    return { connected: null, error: e.message };
+  let hb = null;
+  try { hb = db.getHeartbeat(); } catch (_) {}
+  const name = (hb && hb.deviceName) || config.DEVICE_NAME || 'R4';
+  if (!hb || !hb.lastSeenMs) {
+    return { connected: false, name, via: 'wheelhouse', lastSeen: null,
+      message: 'Wheelhouse has not checked in yet.' };
   }
+  const ageMs = Date.now() - hb.lastSeenMs;
+  const online = ageMs <= (config.WHEELHOUSE_ONLINE_MINUTES || 10) * 60 * 1000;
+  return {
+    connected:  online,
+    name,
+    via:        'wheelhouse',
+    lastSeen:   hb.lastSeen,
+    appVersion: hb.appVersion,
+    freeMB:     hb.freeMB,
+    totalMB:    hb.totalMB,
+    queued:     safeOpenQueueCount(),
+  };
+}
+
+function safeOpenQueueCount() {
+  try { return db.getOpenQueue().length; } catch (_) { return 0; }
 }
 
 // Read the timestamp of the last successful MTP scan. Used to decide which
@@ -170,16 +132,67 @@ function loadPushLog() {
   catch (e) { console.warn('[device/pushlog]', e.message); return { albums: [], albumCount: 0 }; }
 }
 
-// Persist a successful push. SQLite's UPSERT on the 'key' column means
-// re-pushes update in place — no manual filter+sort dance needed.
-function recordPush(artist, album, tracks, sizeMB) {
-  try { db.recordPush(artist, album, tracks, sizeMB); }
-  catch (e) { console.warn('[device] push-log write failed:', e.message); }
+
+// ── Queue helpers ─────────────────────────────────────────────────────────────
+
+// Count audio tracks + total size of an album folder (one level, like the
+// library scan). Reads go through the rclone directory cache, so this is cheap.
+function measureAlbum(absPath) {
+  let tracks = 0, bytes = 0;
+  let entries = [];
+  try { entries = fs.readdirSync(absPath, { withFileTypes: true }); } catch (_) { return null; }
+  for (const e of entries) {
+    if (!e.isFile()) continue;
+    try { bytes += fs.statSync(path.join(absPath, e.name)).size; } catch (_) {}
+    if (isAudioFile(e.name)) tracks++;
+  }
+  return { tracks, sizeMB: Math.round(bytes / 1048576 * 10) / 10 };
+}
+
+// Map a queue row onto the job shape the dashboard already understands.
+function queueItemToJob(q) {
+  const finished = ['done', 'error', 'cancelled'].includes(q.status);
+  return {
+    id:         q.id,
+    batchId:    q.batchId,
+    kind:       q.kind,
+    action:     q.action,
+    artist:     q.artist,
+    album:      q.album,
+    relPath:    q.relPath,
+    sourcePath: q.kind === 'album' ? path.join(config.LIBRARY_PATH, ...q.relPath.split('/')) : null,
+    status:     q.status === 'cancelled' ? 'error' : q.status,
+    cancelled:  q.status === 'cancelled' || undefined,
+    queued:     true,
+    tracks:     q.tracks,
+    sizeMB:     q.sizeMB,
+    error:      q.status === 'cancelled' ? 'Cancelled' : q.error,
+    startedAt:  q.createdAt,
+    finishedAt: finished ? q.updatedAt : null,
+  };
+}
+
+// Validate one push request and turn it into a queue item, or return
+// { error } explaining why it can't be queued.
+function buildAlbumQueueItem({ sourcePath: supplied, artist, album }) {
+  const libPath = resolveUnder(supplied, [config.LIBRARY_PATH]);
+  if (!libPath) {
+    const inInbox = resolveUnder(supplied, [config.INBOX_PATH]);
+    return { error: inInbox
+      ? 'This album is still in the inbox. Move it into the library first; the R4 downloads from the library.'
+      : 'Source path is not in the library.' };
+  }
+  const rel = r2.relFromLibrary(config, libPath);
+  if (!rel) return { error: 'Source path is not in the library.' };
+  const m = measureAlbum(libPath);
+  if (!m) return { error: 'Album folder not found.' };
+  if (m.tracks === 0) return { error: 'No audio files in that folder.' };
+  return { item: { kind: 'album', action: 'download', relPath: rel, artist: artist || '', album: album || '', tracks: m.tracks, sizeMB: m.sizeMB } };
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// GET /api/device/status — quick connection check
+// GET /api/device/status — has Wheelhouse checked in recently?
 router.get('/status', async (req, res) => {
   try {
     res.json(await getStatus());
@@ -212,7 +225,7 @@ router.get('/files', (req, res) => {
 
   if (albumMap.size === 0) {
     return res.json({ albums: [], albumCount: 0, fromCache: false, source: 'none',
-      message: 'No data yet. Run Force MTP Scan on Devices tab, or push an album.' });
+      message: 'No data yet. Tap Scan Device (Wheelhouse reports its albums on its next sync), or push an album.' });
   }
 
   const albums = Array.from(albumMap.values()).sort((a, b) => (a.key || '').localeCompare(b.key || ''));
@@ -231,132 +244,37 @@ router.delete('/pushed', (req, res) => {
   }
 });
 
-// GET /api/device/test-walk — diagnostic: walk the R4 MTP namespace step by step, return raw log
-router.get('/test-walk', async (req, res) => {
-  const scriptPath = path.join(SCRIPTS_DIR, 'test-device-walk.ps1');
-  if (!fs.existsSync(scriptPath)) return res.status(500).json({ error: 'test-device-walk.ps1 not found' });
+// DELETE /api/device/pushed — clear the push log
+router.delete('/pushed', (req, res) => {
   try {
-    const output = await runPSFile(scriptPath, 60000);
-    res.json({ ok: true, output });
+    const before = db.getPushLog().albumCount;
+    db.clearPushLog();
+    db.logActivity('system', 'push-log-cleared', null, { removed: before });
+    res.json({ ok: true, message: 'Push log cleared.' });
   } catch (e) {
-    res.json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: 'Clear failed' });
   }
 });
 
-// GET /api/device/detect — diagnostic: list ALL portable devices and Shell.Application items
-// Use this to find the exact name Windows gives the HiBy so you can update DEVICE_NAME in config.js
+// GET /api/device/detect — kept for the Devices tab's diagnostics button.
 router.get('/detect', async (req, res) => {
-  const os   = require('os');
-  const tmpScript = path.join(os.tmpdir(), 'hiby-detect.ps1');
-  const psContent = `
-$out = @{ wpdDevices = @(); shellItems = @() }
-try {
-  $wpd = Get-PnpDevice -Class WPD -Status OK -ErrorAction SilentlyContinue | Select-Object FriendlyName,InstanceId
-  if ($wpd) {
-    $out.wpdDevices = @($wpd | ForEach-Object { "$($_.FriendlyName) [$($_.InstanceId)]" })
-  }
-} catch {}
-try {
-  $shell  = New-Object -ComObject Shell.Application
-  $thisPC = $shell.NameSpace(17)
-  $out.shellItems = @($thisPC.Items() | ForEach-Object { $_.Name })
-} catch {}
-$out | ConvertTo-Json -Compress
-`;
-  try {
-    fs.writeFileSync(tmpScript, psContent, 'utf8');
-    const result = await runPSFile(tmpScript, 20000);
-    let parsed;
-    try { parsed = JSON.parse(result); } catch (_) { parsed = { raw: result }; }
-    res.json({ ok: true, ...parsed });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  } finally {
-    try { fs.unlinkSync(tmpScript); } catch (_) {}
-  }
+  const status = await getStatus();
+  res.json({ ok: true, via: 'wheelhouse', ...status, wpdDevices: [], shellItems: [] });
 });
 
-// POST /api/device/scan — full MTP file tree scan (slow, runs in background, caches result)
-router.post('/scan', async (req, res) => {
-  const scriptPath = path.join(SCRIPTS_DIR, 'list-device-files.ps1');
-
-  if (!fs.existsSync(scriptPath)) {
-    return res.status(500).json({ error: 'Script not found: ' + scriptPath });
-  }
-
-  // Write a "scanning" marker so the poller can tell the scan is in progress
+// POST /api/device/scan — ask Wheelhouse for its album list. It answers on its
+// next check-in (POST /api/wheelhouse/inventory), which flips the status to
+// 'done'. The dashboard polls /scan-status exactly as it did for USB scans.
+router.post('/scan', (req, res) => {
   const startedAt = new Date().toISOString();
-  try { db.setDeviceScanStatus({ status: 'scanning', startedAt }); }
-  catch (_) {}
-
-  // Respond immediately so the UI can show a "scanning…" state
-  res.json({ status: 'scanning', startedAt, message: 'Device scan started.' });
-
-  // Use a temp file for output — avoids stdout encoding/buffer issues with large MTP scans
-  const TEMP_FILE = path.join(config.CACHE_DIR, 'device-scan-temp.json');
-
-  // Build PS command with -OutFile param so the script writes JSON directly
-  // to disk. Pass an optional -MusicFolder so users with non-default folder
-  // layouts (anything other than "Music") can configure it via .env.
-  const musicFolder = (config.DEVICE_MUSIC_FOLDER || '').trim();
-  const runScan = () => new Promise((resolve, reject) => {
-    const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-                  '-File', scriptPath,
-                  '-OutFile', TEMP_FILE];
-    if (musicFolder) { args.push('-MusicFolder', musicFolder); }
-    const { spawn: spawnChild } = require('child_process');
-    const proc = spawnChild('powershell.exe', args, { windowsHide: true });
-    let stderr = '';
-    proc.stderr.on('data', d => stderr += d.toString());
-    const killTimer = setTimeout(() => { proc.kill(); reject(new Error('Scan timed out after 10 minutes')); }, SCAN_TIMEOUT_MS);
-    proc.on('close', code => {
-      clearTimeout(killTimer);
-      if (code !== 0) return reject(new Error((stderr || `Exit code ${code}`).trim()));
-      resolve();
-    });
-    proc.on('error', reject);
-  });
-
-  // Run in background — 10 min timeout
-  runScan()
-    .then(() => {
-      try {
-        const raw = fs.readFileSync(TEMP_FILE, 'utf8').replace(/^\uFEFF/, '').trim();
-        let data = JSON.parse(raw);
-        if (Array.isArray(data)) data = data[0];
-        // Persist the album list + status separately. Status drives the poll
-        // UI; the album list feeds backlog calculations.
-        const albums = Array.isArray(data.albums) ? data.albums : [];
-        db.setAlbums('device-mtp', albums);
-        db.setDeviceScanStatus({
-          status:     'done',
-          startedAt,
-          scannedAt:  new Date().toISOString(),
-          albumCount: data.albumCount || albums.length,
-          connected:  data.connected,
-        });
-        console.log(`Device scan complete: ${data.albumCount || albums.length} albums found`);
-      } catch (parseErr) {
-        try {
-          db.setDeviceScanStatus({
-            status: 'error',
-            error:  'Could not parse scan output: ' + parseErr.message,
-            scannedAt: new Date().toISOString(),
-          });
-        } catch (_) {}
-        console.error('Device scan parse error:', parseErr.message);
-      }
-    })
-    .catch(err => {
-      try {
-        db.setDeviceScanStatus({
-          status: 'error',
-          error:  err.message,
-          scannedAt: new Date().toISOString(),
-        });
-      } catch (_) {}
-      console.error('Device scan error:', err.message);
-    });
+  try {
+    db.setScanWanted(true);
+    db.setDeviceScanStatus({ status: 'scanning', startedAt, scannedAt: null });
+  } catch (e) {
+    return res.status(500).json({ error: 'Could not request a scan' });
+  }
+  res.json({ status: 'scanning', startedAt,
+    message: 'Asked the R4 for its album list. Open Wheelhouse on the R4 (Wi-Fi on) and it will report in.' });
 });
 
 // GET /api/device/scan-status — returns current scan state from DB
@@ -385,7 +303,7 @@ router.get('/verify', (req, res) => {
     return res.json({
       ok: false,
       reason: 'no-scan',
-      message: 'Run Force MTP Scan on the Devices tab first — without a scan there is no ground truth to verify the push log against.',
+      message: 'Run a device scan first — Wheelhouse reports what is on the R4, which is the ground truth to verify the push log against.',
     });
   }
 
@@ -447,7 +365,7 @@ router.post('/verify/prune', (req, res) => {
   catch (_) { scanAlbums = []; }
   const scanTime = getLastScanTime();
   if (!scanTime || scanAlbums.length === 0) {
-    return res.status(400).json({ ok: false, error: 'Run Force MTP Scan first.' });
+    return res.status(400).json({ ok: false, error: 'Run a device scan first.' });
   }
 
   const mtpKeys = new Set();
@@ -479,280 +397,101 @@ router.post('/verify/prune', (req, res) => {
   res.json({ ok: true, removed, candidates: keysToDrop.length });
 });
 
-// ── Push tracking — simple in-memory queue ─────────────────────────────────────
-const pushJobs = [];  // { id, artist, album, status, progress, error, startedAt, finishedAt }
-let _pushIdCounter = 1;
+// ── Push = add to the Wheelhouse download queue ────────────────────────────────
 
-// GET /api/device/push — return current push job list
+// GET /api/device/push — recent queue items in the old "jobs" shape
 router.get('/push', (req, res) => {
-  res.json({ jobs: pushJobs.slice(-20) });  // last 20 jobs
+  try { db.tidyQueue(); } catch (_) {}
+  let items = [];
+  try { items = db.getRecentQueue(200); } catch (_) {}
+  res.json({ jobs: items.map(queueItemToJob), queued: safeOpenQueueCount() });
 });
 
-// POST /api/device/push
-// Body: { sourcePath, artist, album, force }
-// Pushes one album folder from master library to the HiBy SD card via MTP.
-// Pass force:true to skip the duplicate check.
+// POST /api/device/push  { sourcePath, artist, album, force }
 router.post('/push', validateBody(DevicePushBody), (req, res) => {
-  const { sourcePath: suppliedPath, artist, album, force } = req.body;
-  // sourcePath must sit under LIBRARY_PATH (or INBOX_PATH for direct-from-inbox pushes).
-  const sourcePath = resolveUnder(suppliedPath, [config.LIBRARY_PATH, config.INBOX_PATH]);
-  if (!sourcePath || !fs.existsSync(sourcePath)) {
-    return res.status(404).json({ error: 'Source path not found' });
-  }
+  const { artist, album, force } = req.body;
 
-  // ── Duplicate check ───────────────────────────────────────────────────────
   if (!force && isAlreadyOnDevice(artist, album)) {
     return res.json({
-      ok:      true,
-      skipped: true,
-      reason:  'already_on_device',
-      artist,
-      album,
+      ok: true, skipped: true, reason: 'already_on_device', artist, album,
       message: `"${artist} — ${album}" is already on your HiBy — skipped.`,
     });
   }
 
-  const scriptPath = path.join(SCRIPTS_DIR, 'push-to-device.ps1');
-  if (!fs.existsSync(scriptPath)) {
-    return res.status(500).json({ error: 'Push script not found' });
+  const built = buildAlbumQueueItem(req.body);
+  if (built.error) return res.status(400).json({ ok: false, error: built.error });
+
+  try {
+    const { items } = db.enqueueDevice([built.item]);
+    const job = items[0];
+    db.logActivity('push', 'queued-for-device', `${artist} — ${album}`, { tracks: job.tracks, sizeMB: job.sizeMB });
+    res.json({
+      ok: true, queued: true, jobId: job.id, status: 'queued',
+      message: `Queued "${artist} — ${album}" for the R4. It downloads the next time Wheelhouse syncs.`,
+    });
+  } catch (e) {
+    console.error('[device/push]', e.message);
+    res.status(500).json({ ok: false, error: 'Could not queue album' });
   }
-
-  const jobId = _pushIdCounter++;
-  const job = { id: jobId, artist, album, sourcePath, status: 'running', startedAt: new Date().toISOString() };
-  pushJobs.push(job);
-  if (pushJobs.length > 200) pushJobs.splice(0, pushJobs.length - 200);
-
-  // Respond immediately — the push runs in background
-  res.json({ ok: true, jobId, status: 'running', message: `Pushing "${artist} — ${album}" to device…` });
-
-  // Use a temp file for JSON output — avoids all stdout encoding issues
-  const pushOutFile = path.join(config.CACHE_DIR, `push-result-${jobId}.json`);
-
-  // Ensure cache dir exists
-  fs.mkdirSync(config.CACHE_DIR, { recursive: true });
-
-  // Build a PowerShell -Command string using single-quoted PS strings (no injection, no -File binding issues)
-  const esc = s => s.replace(/'/g, "''");  // PS single-quote escape
-  const psCmd = `& '${esc(scriptPath)}' -SourcePath '${esc(sourcePath)}' -Artist '${esc(artist || '_')}' -Album '${esc(album)}' -OutFile '${esc(pushOutFile)}'`;
-
-  // Use spawn() so no cmd.exe wrapper; -Command takes the whole script-call as one string
-  const psArgs = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psCmd];
-
-  const stdoutChunks = [];
-  const stderrChunks = [];
-  const ps = spawn('powershell.exe', psArgs, { windowsHide: true });
-
-  ps.stdout.on('data', d => stdoutChunks.push(d));
-  ps.stderr.on('data', d => stderrChunks.push(d));
-
-  // Safety timeout: kill after PUSH_JOB_TIMEOUT_MS.
-  const killTimer = setTimeout(() => {
-    ps.kill();
-    job.status = 'error';
-    job.error  = `Push timed out after ${Math.round(PUSH_JOB_TIMEOUT_MS / 60000)} minutes`;
-  }, PUSH_JOB_TIMEOUT_MS);
-
-  ps.on('close', exitCode => {
-    clearTimeout(killTimer);
-    job.finishedAt = new Date().toISOString();
-    const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-    const stderr = Buffer.concat(stderrChunks).toString('utf8');
-    // Always try to read result from OutFile — Bail() also writes there
-    let result = null;
-    try {
-      if (fs.existsSync(pushOutFile)) {
-        const raw = fs.readFileSync(pushOutFile, 'utf8').replace(/^\uFEFF/, '').trim();
-        result = JSON.parse(raw);
-        if (Array.isArray(result)) result = result[0];
-      }
-    } catch (parseErr) {
-      console.error(`Push job ${jobId} outfile parse error:`, parseErr.message);
-    }
-    try { fs.unlinkSync(pushOutFile); } catch (_) {}
-
-    // Fallback: scan stdout for JSON line
-    if (!result) {
-      const lines = stdout.replace(/^\uFEFF/, '').trim().split('\n');
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const l = lines[i].trim();
-        if (l.startsWith('{')) {
-          try { result = JSON.parse(l); break; } catch (_) {}
-        }
-      }
-    }
-
-    if (result && result.ok) {
-      job.status = 'done';
-      // Record the count actually verified on the device (falls back to the
-      // expected count for legacy callers that don't return tracksOnDevice).
-      const recordedTracks = Number.isFinite(result.tracksOnDevice)
-        ? result.tracksOnDevice
-        : result.tracks;
-      job.tracks         = result.tracks;
-      job.tracksOnDevice = recordedTracks;
-      job.sizeMB         = result.sizeMB;
-      job.verified       = result.verified !== false;
-      if (result.warning) job.warning = result.warning;
-      try { recordPush(artist, album, recordedTracks, result.sizeMB); } catch (_) {}
-      try {
-        db.logActivity('push', 'pushed', `${artist} — ${album}`, {
-          tracks:         result.tracks,
-          tracksOnDevice: recordedTracks,
-          verified:       job.verified,
-          sizeMB:         result.sizeMB,
-          warning:        result.warning || null,
-        });
-      } catch (_) {}
-      const verifLabel = job.verified ? 'verified' : `PARTIAL (${recordedTracks}/${result.tracks})`;
-      console.log(`Push job ${jobId}: "${artist} — ${album}" -> device [${verifLabel}, ${result.sizeMB} MB]`);
-    } else {
-      job.status = 'error';
-      const stderrMsg = stderr.trim().slice(-400);
-      job.error  = (result && result.error)
-        || (exitCode !== 0 ? (stderrMsg || `Script exited with code ${exitCode}`) : null)
-        || (stderrMsg ? `Exit 0 but no output — stderr: ${stderrMsg}` : 'Script exited cleanly but wrote no output');
-      console.error(`Push job ${jobId} error:`, job.error);
-    }
-  });
 });
 
-// POST /api/device/push-batch
-// Body: { albums: [{ sourcePath, artist, album }, …] }
-// Queues multiple albums for sequential push.
+// POST /api/device/push-batch  { albums: [{ sourcePath, artist, album, force }] }
 router.post('/push-batch', validateBody(DevicePushBatchBody), (req, res) => {
-  const { albums } = req.body;
-  const batchId = _pushIdCounter++;
-
-  // Create a job entry for each album up front so the UI can track them.
-  // Reject any path that doesn't resolve under LIBRARY_PATH or INBOX_PATH.
-  const batchJobs = [];
-  for (const { sourcePath: suppliedPath, artist, album, force } of albums) {
-    if (!suppliedPath || !artist || !album) continue;
-    const sourcePath = resolveUnder(suppliedPath, [config.LIBRARY_PATH, config.INBOX_PATH]);
-    if (!sourcePath || !fs.existsSync(sourcePath)) continue;
-    const jobId = _pushIdCounter++;
-    const job = {
-      id: jobId,
-      batchId,
-      artist,
-      album,
-      sourcePath,
-      status: 'queued',
-      startedAt: new Date().toISOString(),
-    };
-    pushJobs.push(job);
-    if (pushJobs.length > 200) pushJobs.splice(0, pushJobs.length - 200);
-    batchJobs.push({ job, sourcePath, artist, album, force });
+  const toQueue = [];
+  const problems = [];
+  let skipped = 0;
+  for (const a of req.body.albums) {
+    if (!a.force && isAlreadyOnDevice(a.artist, a.album)) { skipped++; continue; }
+    const built = buildAlbumQueueItem(a);
+    if (built.error) problems.push({ artist: a.artist, album: a.album, error: built.error });
+    else toQueue.push(built.item);
   }
 
-  res.json({ ok: true, batchId, total: batchJobs.length, message: `Queued ${batchJobs.length} album(s) for sync` });
+  if (toQueue.length === 0) {
+    return res.json({
+      ok: problems.length === 0, queued: true, batchId: null, total: 0, skipped, problems,
+      error: problems.length ? problems[0].error : undefined,
+      message: skipped ? `All ${skipped} album(s) are already on the R4.` : 'Nothing to queue.',
+    });
+  }
 
-  // Run sequentially in background, updating job status as each completes
-  (async () => {
-    let skipped = 0;
-    for (const { job, sourcePath, artist, album, force } of batchJobs) {
-      // Skip albums already on the device (unless force flag set)
-      if (!force && isAlreadyOnDevice(artist, album)) {
-        console.log(`Batch push: skipping "${artist} — ${album}" (already on device)`);
-        job.status = 'done';
-        job.skipped = true;
-        job.finishedAt = new Date().toISOString();
-        skipped++;
-        continue;
-      }
+  try {
+    const { batchId, items } = db.enqueueDevice(toQueue);
+    db.logActivity('push', 'queued-for-device', `${items.length} album(s)`, { batchId, skipped, problems: problems.length });
+    res.json({
+      ok: true, queued: true, batchId, total: items.length, skipped, problems,
+      message: `Queued ${items.length} album(s) for the R4. They download the next time Wheelhouse syncs.`,
+    });
+  } catch (e) {
+    console.error('[device/push-batch]', e.message);
+    res.status(500).json({ ok: false, error: 'Could not queue albums' });
+  }
+});
 
-      job.status = 'running';
-      const scriptPath = path.join(SCRIPTS_DIR, 'push-to-device.ps1');
+// GET /api/device/queue — what the R4 still has to fetch
+router.get('/queue', (req, res) => {
+  try {
+    const open = db.getOpenQueue();
+    res.json({ ok: true, items: open.map(queueItemToJob), count: open.length,
+      totalMB: Math.round(open.reduce((s, q) => s + (q.sizeMB || 0), 0)) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Could not read queue' });
+  }
+});
 
-      // Use a temp OutFile so the script writes structured JSON to disk (avoids stdout encoding issues)
-      const pushOutFile = path.join(config.CACHE_DIR, `push-result-${job.id}.json`);
-      fs.mkdirSync(config.CACHE_DIR, { recursive: true });
-
-      // Use spawn() with -Command mode (same as single push) — avoids cmd.exe space-splitting
-      // that breaks single-quoted paths when exec() is used with -File mode.
-      const esc = s => s.replace(/'/g, "''");
-      const psCmd = `& '${esc(scriptPath)}' -SourcePath '${esc(sourcePath)}' -Artist '${esc(artist || '_')}' -Album '${esc(album)}' -OutFile '${esc(pushOutFile)}'`;
-      const psArgs = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psCmd];
-
-      await new Promise((resolve) => {
-        const stdoutChunks = [];
-        const stderrChunks = [];
-        const ps = spawn('powershell.exe', psArgs, { windowsHide: true });
-        ps.stdout.on('data', d => stdoutChunks.push(d));
-        ps.stderr.on('data', d => stderrChunks.push(d));
-
-        // Safety timeout: BATCH_PUSH_TIMEOUT_MS per album.
-        const killTimer = setTimeout(() => {
-          ps.kill();
-          job.status = 'error';
-          job.error  = `Push timed out after ${Math.round(BATCH_PUSH_TIMEOUT_MS / 60000)} minutes`;
-          resolve();
-        }, BATCH_PUSH_TIMEOUT_MS);
-
-        ps.on('close', exitCode => {
-          clearTimeout(killTimer);
-          job.finishedAt = new Date().toISOString();
-          const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-          const stderr = Buffer.concat(stderrChunks).toString('utf8');
-          // Try to read result from OutFile
-          let result = null;
-          try {
-            if (fs.existsSync(pushOutFile)) {
-              const raw = fs.readFileSync(pushOutFile, 'utf8').replace(/^﻿/, '').trim();
-              result = JSON.parse(raw);
-              if (Array.isArray(result)) result = result[0];
-            }
-          } catch (_) {}
-          try { fs.unlinkSync(pushOutFile); } catch (_) {}
-
-          // Fallback: scan stdout for JSON line
-          if (!result) {
-            const lines = stdout.replace(/^﻿/, '').trim().split('\n');
-            for (let i = lines.length - 1; i >= 0; i--) {
-              const l = lines[i].trim();
-              if (l.startsWith('{')) { try { result = JSON.parse(l); break; } catch (_) {} }
-            }
-          }
-
-          if (result && result.ok) {
-            job.status = 'done';
-            const recordedTracks = Number.isFinite(result.tracksOnDevice)
-              ? result.tracksOnDevice
-              : result.tracks;
-            job.tracks         = result.tracks;
-            job.tracksOnDevice = recordedTracks;
-            job.sizeMB         = result.sizeMB;
-            job.verified       = result.verified !== false;
-            if (result.warning) job.warning = result.warning;
-            try { recordPush(artist, album, recordedTracks, result.sizeMB); } catch (_) {}
-            try {
-              db.logActivity('push', 'pushed', `${artist} — ${album}`, {
-                tracks:         result.tracks,
-                tracksOnDevice: recordedTracks,
-                verified:       job.verified,
-                sizeMB:         result.sizeMB,
-                warning:        result.warning || null,
-                batch:          true,
-              });
-            } catch (_) {}
-            const verifLabel = job.verified ? 'verified' : `PARTIAL ${recordedTracks}/${result.tracks}`;
-            console.log(`Batch push OK: ${artist} — ${album} [${verifLabel}, ${result.sizeMB} MB]`);
-          } else {
-            job.status = 'error';
-            const stderrMsg = stderr.trim().slice(-400);
-            job.error = (result && result.error)
-              || (exitCode !== 0 ? (stderrMsg || `Script exited with code ${exitCode}`) : null)
-              || (stderrMsg ? `Exit 0 but no output — stderr: ${stderrMsg}` : 'Script exited cleanly but wrote no output');
-            console.error(`Batch push failed for ${artist} — ${album}:`, job.error);
-          }
-          resolve();
-        });
-      });
-    }
-    if (skipped > 0) console.log(`Batch push: ${skipped} album(s) already on device — skipped.`);
-  })().catch(e => console.error('Batch push error:', e.message));
+// DELETE /api/device/queue/:id — cancel a queued item
+router.delete('/queue/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const item = Number.isFinite(id) ? db.getQueueItem(id) : null;
+  if (!item) return res.status(404).json({ ok: false, error: 'Not found' });
+  if (!['queued', 'running'].includes(item.status)) {
+    return res.status(409).json({ ok: false, error: `Already ${item.status}` });
+  }
+  db.setQueueStatus(id, 'cancelled', null);
+  res.json({ ok: true });
 });
 
 module.exports = router;
-module.exports.getStatus      = getStatus;
+module.exports.getStatus       = getStatus;
 module.exports.getCachedAlbums = getCachedAlbums;
+module.exports.queueItemToJob  = queueItemToJob;

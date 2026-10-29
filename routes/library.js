@@ -145,7 +145,23 @@ async function scanLibrary() {
   // is just a tag-header read (no full audio decode), so a couple-hundred
   // albums on an external drive completes in seconds at concurrency 8.
   // Errors per album are swallowed: genre is best-effort, not load-bearing.
+  //
+  // On the server the library is an rclone mount of R2, where every tag read
+  // is a network fetch. So reuse the genre from the previous scan whenever an
+  // album folder is unchanged (same path, same modified time) and only read
+  // tags for new or edited albums.
+  const previous = new Map();
+  try {
+    for (const p of db.getAlbums('library')) {
+      if (p.path && Object.prototype.hasOwnProperty.call(p, 'genre')) previous.set(p.path, p);
+    }
+  } catch (_) { /* first scan or DB unavailable — read everything */ }
+
+  let genreReads = 0;
   await mapLimit(albums, 8, async a => {
+    const prior = previous.get(a.path);
+    if (prior && prior.addedAt === a.addedAt) { a.genre = prior.genre; return; }
+    genreReads++;
     try { a.genre = await readAlbumGenre(a.path); }
     catch (_) { a.genre = null; }
   });
@@ -160,6 +176,7 @@ async function scanLibrary() {
     trackCount: stamped.reduce((s, a) => s + a.tracks, 0),
     path: libPath,
     scannedAt: scannedAtIso,
+    genreReads,
   };
 
   // Persist to SQLite. setAlbums replaces the entire 'library' set inside a

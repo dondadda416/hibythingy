@@ -72,7 +72,7 @@ router.get('/scan', async (req, res) => {
 // POST /api/metadata/open-mp3tag
 // Convenience: opens the album folder in Mp3tag (Windows only via explorer).
 // Body: { path }
-router.post('/open-mp3tag', (req, res) => {
+router.post('/open-mp3tag', require('../lib/platform').requireWindows('Opening Mp3tag'), (req, res) => {
   const { path: albumPath } = req.body || {};
   if (!albumPath || !fs.existsSync(albumPath)) {
     return res.status(400).json({ error: 'Path not found' });

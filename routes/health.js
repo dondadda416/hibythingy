@@ -295,7 +295,7 @@ router.get('/flac-integrity', async (req, res) => {
 
 // POST /api/health/open-folder — open a folder in Windows Explorer
 // Body: { folderPath }
-router.post('/open-folder', validateBody(HealthFolderBody), (req, res) => {
+router.post('/open-folder', require('../lib/platform').requireWindows('Opening folders'), validateBody(HealthFolderBody), (req, res) => {
   const { folderPath: suppliedPath } = req.body;
   const folderPath = resolveUnder(suppliedPath, [config.INBOX_PATH, config.LIBRARY_PATH]);
   if (!folderPath) return res.status(403).json({ error: 'Path is outside managed folders' });

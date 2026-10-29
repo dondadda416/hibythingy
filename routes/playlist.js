@@ -4,12 +4,9 @@ const express      = require('express');
 const router       = express.Router();
 const fs           = require('fs');
 const path         = require('path');
-const { spawn }    = require('child_process');
 const config       = require('../config');
 const libraryRoute = require('./library');
 const { AUDIO_EXTS } = require('../lib/format');
-
-const SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
 
 const PLAYLISTS_DIR = path.join(config.LIBRARY_PATH, 'Playlists');
 
@@ -291,337 +288,83 @@ router.delete('/:name', (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/playlist/push — copy a saved playlist to the HiBy SD card via MTP
+// POST /api/playlist/push — queue a saved playlist for the R4. Wheelhouse
+// downloads it into <music>/Playlists/ on its next sync. The .m3u8 uses paths
+// relative to Playlists/ (../Artist/Album/track.flac), which resolve on the R4
+// because Wheelhouse mirrors the library's folder layout.
 router.post('/push', (req, res) => {
   const { name } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
 
-  // Accept either extension; prefer the newer .m3u8 if both exist.
-  const base = name.replace(/\.(m3u8?|m3u)$/i, '');
+  const base = String(name).replace(/\.(m3u8?|m3u)$/i, '');
+  if (/[\\/]|\.\./.test(base)) return res.status(400).json({ error: 'Invalid playlist name' });
   const m3u8 = path.join(PLAYLISTS_DIR, base + '.m3u8');
   const m3u  = path.join(PLAYLISTS_DIR, base + '.m3u');
   const file = fs.existsSync(m3u8) ? m3u8 : m3u;
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'Playlist not found: ' + name });
 
-  const scriptPath = path.join(SCRIPTS_DIR, 'push-playlist.ps1');
-  if (!fs.existsSync(scriptPath)) return res.status(500).json({ error: 'push-playlist.ps1 not found' });
-
-  const outFile = path.join(config.CACHE_DIR, `playlist-push-${Date.now()}.json`);
-  const esc = s => s.replace(/'/g, "''");
-  const psCmd = `& '${esc(scriptPath)}' -SourceFile '${esc(file)}' -OutFile '${esc(outFile)}'`;
-  const psArgs = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psCmd];
-
-  const stdoutChunks = [], stderrChunks = [];
-  const ps = spawn('powershell.exe', psArgs, { windowsHide: true });
-  ps.stdout.on('data', d => stdoutChunks.push(d));
-  ps.stderr.on('data', d => stderrChunks.push(d));
-
-  // Wait for PS1 to finish (up to 2 min) so we can return the real result.
-  // The previous 45s budget wasn't enough when the SD root has many items —
-  // Shell.Application's MTP enumeration is genuinely slow regardless of the
-  // tiny playlist file size. ParseName fast-path in the script should bring
-  // this well under 30s in practice; the higher cap just absorbs spikes.
-  const PLAYLIST_PUSH_TIMEOUT_MS = 120_000;
-  const killTimer = setTimeout(() => {
-    ps.kill();
-    try { fs.unlinkSync(outFile); } catch (_) {}
-    if (!res.headersSent) res.status(504).json({ ok: false, error: `Push timed out after ${PLAYLIST_PUSH_TIMEOUT_MS / 1000}s. Is the HiBy connected via USB in MTP mode?` });
-  }, PLAYLIST_PUSH_TIMEOUT_MS);
-
-  ps.on('close', exitCode => {
-    clearTimeout(killTimer);
-    if (res.headersSent) return;
-
-    const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-    const stderr = Buffer.concat(stderrChunks).toString('utf8');
-    let result = null;
-    try {
-      if (fs.existsSync(outFile)) {
-        result = JSON.parse(fs.readFileSync(outFile, 'utf8').replace(/^﻿/, '').trim());
-      }
-    } catch (_) {}
-    try { fs.unlinkSync(outFile); } catch (_) {}
-
-    if (stderr) console.error(`[playlist-push stderr] ${stderr.slice(0, 400)}`);
-
-    if (result && result.ok) {
-      const landedAs = result.file || result.originalName || name;
-      console.log(`Playlist pushed: ${name} -> ${(result.pushed || []).join(', ')} (as ${landedAs})`);
-      try {
-        const db = require('../lib/db');
-        db.logActivity('push', 'playlist-pushed', name, {
-          locations:    result.pushed || [],
-          landedAs,
-          originalName: result.originalName || null,
-        });
-      } catch (_) {}
-      res.json({
-        ok:           true,
-        name,
-        file:         result.file,
-        originalName: result.originalName || null,
-        pushed:       result.pushed || [],
-        warnings:     result.errors  || [],
-      });
-    } else {
-      const err = (result && result.error) || stderr.trim().slice(-400) || `Exit code ${exitCode}`;
-      console.error(`Playlist push failed (${name}):`, err);
-      // Persist the failure to the activity log so the user can review it
-      // in Jobs & Logs even if the toast disappeared before they noticed it.
-      try {
-        const db = require('../lib/db');
-        db.logActivity('push', 'playlist-push-failed', name, {
-          error: err,
-          stderr: stderr ? stderr.slice(-400) : '',
-          exitCode,
-          partial: result && result.pushed ? result.pushed : [],
-        });
-      } catch (_) {}
-      res.status(500).json({ ok: false, error: err });
-    }
-  });
-});
-
-// ── Device playlist cleanup ──────────────────────────────────────────────────
-// Two endpoints for the "Clean Duplicates" UI: one to list playlist files on
-// the device, one to delete a user-selected subset. Both shell out to
-// PowerShell scripts because everything on the R4 lives behind the MTP
-// namespace which only Shell.Application can talk to.
-
-// GET /api/playlist/device-list
-// Returns every .m3u / .m3u8 file in SD:\Playlists\ and SD:\Music\Playlists\,
-// annotated with whether each one looks like a duplicate that can be safely
-// cleaned. The annotation is conservative — anything that isn't an obvious
-// duplicate stays unflagged so the user can decide.
-router.get('/device-list', (req, res) => {
-  const scriptPath = path.join(SCRIPTS_DIR, 'list-device-playlists.ps1');
-  if (!fs.existsSync(scriptPath)) return res.status(500).json({ error: 'list-device-playlists.ps1 not found' });
-
-  const outFile = path.join(config.CACHE_DIR, `device-pl-list-${Date.now()}.json`);
-  const esc = s => s.replace(/'/g, "''");
-  const psCmd = `& '${esc(scriptPath)}' -OutFile '${esc(outFile)}'`;
-  const psArgs = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psCmd];
-
-  const stdoutChunks = [], stderrChunks = [];
-  const ps = spawn('powershell.exe', psArgs, { windowsHide: true });
-  ps.stdout.on('data', d => stdoutChunks.push(d));
-  ps.stderr.on('data', d => stderrChunks.push(d));
-
-  const killTimer = setTimeout(() => {
-    ps.kill();
-    try { fs.unlinkSync(outFile); } catch (_) {}
-    if (!res.headersSent) res.status(504).json({ ok: false, error: 'Device scan timed out after 60s.' });
-  }, 60000);
-
-  ps.on('close', exitCode => {
-    clearTimeout(killTimer);
-    if (res.headersSent) return;
-    let result = null;
-    try {
-      if (fs.existsSync(outFile)) result = JSON.parse(fs.readFileSync(outFile, 'utf8').replace(/^﻿/, '').trim());
-    } catch (_) {}
-    try { fs.unlinkSync(outFile); } catch (_) {}
-
-    if (!result) {
-      const stderr = Buffer.concat(stderrChunks).toString('utf8').trim().slice(-400);
-      return res.status(500).json({ ok: false, error: stderr || `Script exited with code ${exitCode}` });
-    }
-    if (!result.ok) {
-      return res.status(500).json({ ok: false, error: result.error || 'Scan failed', files: [] });
-    }
-
-    // Build the duplicate-detection annotations. Rules:
-    //   - Any file in Music\Playlists\ -> duplicate of the canonical SD root
-    //     copy (or stale legacy file).
-    //   - Any .m3u file anywhere -> superseded by the .m3u8 generation, mark
-    //     as duplicate if a same-stem .m3u8 also exists.
-    //   - "name 1.m3u8" / "name 2.m3u8" auto-suffix forms when "name.m3u8"
-    //     also exists -> duplicate (HiByMusic disambiguation leftover).
-    const files  = (result.files || []);
-    const stems  = new Map();   // lowercased-stem -> [files...] for cross-check
-    for (const f of files) {
-      const stem = f.name.replace(/\.(m3u8?|m3u)$/i, '').toLowerCase();
-      if (!stems.has(stem)) stems.set(stem, []);
-      stems.get(stem).push(f);
-    }
-
-    // Reduce a stem to its canonical playlist name so timestamped Hub
-    // pushes and HiByMusic's "name 1" auto-suffix forms get grouped with
-    // their canonical sibling. "Dance.20260519-214530" -> "Dance",
-    // "Dance 1" -> "Dance".
-    function canonicalStem(stem) {
-      let s = stem.replace(/\s+\d+$/, '').trim();          // strip " 1", " 2" auto-suffix
-      s = s.replace(/\.\d{8}-\d{6}$/, '').trim();           // strip Hub's ".YYYYMMDD-HHMMSS" timestamp
-      return s;
-    }
-
-    const annotated = files.map(f => {
-      const stem  = f.name.replace(/\.(m3u8?|m3u)$/i, '').toLowerCase();
-      const reasons = [];
-      let suggested = false;
-
-      // Location strings now include the volume prefix, e.g.
-      // "SanDisk SD card\Music\Playlists" or "Internal Storage\Playlists".
-      // Canonical destination on this firmware is <volume>\Music\Playlists\.
-      // Anything OUTSIDE that — root-level Playlists\, HiByMusic\Playlists\,
-      // etc. — is treated as a stale or duplicate copy.
-      const loc = String(f.location || '');
-      const isCanonical = /\\Music\\Playlists$/i.test(loc);
-      const isRootPL    = /^[^\\]+\\Playlists$/i.test(loc);
-      const isHiByPL    = /\\HiByMusic\\Playlists$/i.test(loc);
-      if (isRootPL) {
-        reasons.push('legacy SD-root Playlists location (Hub now pushes to Music\\Playlists)');
-        suggested = true;
-      }
-      if (isHiByPL) {
-        reasons.push('inside HiByMusic\\Playlists (managed by the app — usually safe to remove if duplicated elsewhere)');
-        suggested = true;
-      }
-      if (f.ext === '.m3u') {
-        const m3u8twin = stems.get(stem) && stems.get(stem).some(o => o !== f && o.ext === '.m3u8');
-        if (m3u8twin) {
-          reasons.push('superseded by the .m3u8 copy');
-          suggested = true;
-        } else {
-          reasons.push('legacy .m3u format (Hub generates .m3u8 now)');
-          suggested = true;
-        }
-      }
-      // "name 1" / "name 2" auto-suffix forms when the un-suffixed name also
-      // exists somewhere -> duplicate.
-      const canon = canonicalStem(stem);
-      if (canon !== stem) {
-        const baseExists = files.some(o => o !== f && o.name.replace(/\.(m3u8?|m3u)$/i, '').toLowerCase() === canon);
-        if (baseExists) {
-          reasons.push('auto-suffix duplicate of "' + canon + '"');
-          suggested = true;
-        }
-      }
-
-      return { ...f, suggested, reasons, _canon: canon, _stem: stem };
-    });
-
-    // Second pass: if multiple files share a canonical stem (e.g. several
-    // timestamped Hub pushes of the same playlist), mark all but the newest
-    // as duplicates so the user can sweep them in one go.
-    const canonGroups = new Map();
-    for (const f of annotated) {
-      if (!canonGroups.has(f._canon)) canonGroups.set(f._canon, []);
-      canonGroups.get(f._canon).push(f);
-    }
-    for (const [canon, group] of canonGroups) {
-      if (group.length <= 1) continue;
-      // Treat Hub's timestamp suffix as the sort key when present; fall back
-      // to the raw stem so non-timestamped files still order deterministically.
-      group.sort((a, b) => (b._stem > a._stem ? 1 : (b._stem < a._stem ? -1 : 0)));
-      // Skip [0] (the newest), mark the rest.
-      for (let i = 1; i < group.length; i++) {
-        const f = group[i];
-        if (!f.reasons.some(r => r.startsWith('older version'))) {
-          f.reasons.push(`older version of "${canon}" (newest: ${group[0].name})`);
-          f.suggested = true;
-        }
-      }
-    }
-    // Strip the internal helper fields before sending to client.
-    for (const f of annotated) { delete f._canon; delete f._stem; }
-
-    const suggestedCount = annotated.filter(f => f.suggested).length;
+  try {
+    const db = require('../lib/db');
+    const relPath = `Playlists/${path.basename(file)}`;
+    const { items } = db.enqueueDevice([{ kind: 'playlist', action: 'download', relPath, album: base }]);
+    db.logActivity('push', 'playlist-queued', base, { relPath });
     res.json({
-      ok: true,
-      deviceName:  result.deviceName,
-      volume:      result.volume,
-      volumes:     result.volumes     || [],
-      diagnostics: result.diagnostics || [],
-      files:       annotated,
-      total:       annotated.length,
-      suggestedCount,
+      ok: true, queued: true, jobId: items[0].id, name: base, file: path.basename(file),
+      pushed: [], warnings: [],
+      message: `Queued "${base}" for the R4. It downloads the next time Wheelhouse syncs.`,
     });
-  });
+  } catch (e) {
+    console.error('[playlist/push]', e.message);
+    res.status(500).json({ ok: false, error: 'Could not queue playlist' });
+  }
 });
 
-// POST /api/playlist/device-delete
-// Body: { paths: ["Playlists\\foo.m3u", "Music\\Playlists\\bar.m3u8", ...] }
-// Each path must be inside SD:\Playlists\ or SD:\Music\Playlists\ and must
-// be a .m3u or .m3u8 file. Path validation happens here AND in the script.
+// GET /api/playlist/device-list — playlists the R4 reported on its last
+// Wheelhouse inventory, annotated the same way the old USB scan was.
+router.get('/device-list', (req, res) => {
+  const wheelhouse = require('./wheelhouse');
+  const { playlists, reportedAt } = wheelhouse.devicePlaylists();
+  if (!playlists) {
+    return res.json({ ok: true, deviceName: config.DEVICE_NAME, volume: null, volumes: [],
+      diagnostics: ['The R4 has not reported its playlists yet. Run Scan Device, then open Wheelhouse on the R4.'],
+      files: [], total: 0, suggestedCount: 0 });
+  }
+  const files = playlists.map(p => {
+    const rel = String(p).replace(/\\/g, '/');
+    return { path: rel, name: rel.split('/').pop(), reasons: [], suggested: false };
+  });
+  // Flag obvious duplicates: same name apart from a "(1)"/" - Copy" suffix.
+  const canon = n => n.replace(/\.(m3u8?)$/i, '').replace(/\s*(\(\d+\)|- copy|copy)$/i, '').trim().toLowerCase();
+  const seen = new Map();
+  for (const f of files) {
+    const c = canon(f.name);
+    if (seen.has(c)) { f.suggested = true; f.reasons.push(`duplicate of "${seen.get(c).name}"`); }
+    else seen.set(c, f);
+  }
+  res.json({ ok: true, deviceName: config.DEVICE_NAME, volume: null, volumes: [],
+    diagnostics: [`Reported by Wheelhouse at ${reportedAt}`],
+    files, total: files.length, suggestedCount: files.filter(f => f.suggested).length });
+});
+
+// POST /api/playlist/device-delete { paths: [...] } — queue deletions for the
+// R4. Only playlist files under a Playlists folder are accepted.
 router.post('/device-delete', (req, res) => {
   const paths = Array.isArray(req.body && req.body.paths) ? req.body.paths : null;
   if (!paths || paths.length === 0) return res.status(400).json({ ok: false, error: 'paths array required' });
-
-  // Server-side filter — even though the script re-validates, refusing the
-  // request earlier means a typo in the frontend can never reach PS.
-  // Paths look like "<Volume>\Playlists\file.m3u8" or
-  //                 "<Volume>\Music\Playlists\file.m3u8" or
-  //                 "<Volume>\HiByMusic\Playlists\file.m3u8"
-  const safe = paths.filter(p => {
-    if (typeof p !== 'string') return false;
-    if (p.includes('..') || p.includes('/')) return false;
-    const segs = p.split('\\');
-    if (segs.length < 3) return false;
-    // NOTE: we do NOT require a .m3u8 extension here — MTP strips extensions
-    // from displayed names ("Dance" instead of "Dance.m3u8"). The real guard
-    // is that the path must sit inside a Playlists folder, which only ever
-    // contains playlist files.
-    const inRoot  = segs.length === 3 && segs[1] === 'Playlists';
-    const inMusic = segs.length === 4 && segs[1] === 'Music'     && segs[2] === 'Playlists';
-    const inHiby  = segs.length === 4 && segs[1] === 'HiByMusic' && segs[2] === 'Playlists';
-    return inRoot || inMusic || inHiby;
-  });
-  if (safe.length === 0) return res.status(400).json({ ok: false, error: 'No valid playlist paths in request' });
-
-  const scriptPath = path.join(SCRIPTS_DIR, 'delete-device-playlists.ps1');
-  if (!fs.existsSync(scriptPath)) return res.status(500).json({ ok: false, error: 'delete-device-playlists.ps1 not found' });
-
-  // Write the path list to a temp JSON file. Avoids PowerShell command-line
-  // quoting headaches for filenames containing quotes, ampersands, etc.
-  fs.mkdirSync(config.CACHE_DIR, { recursive: true });
-  const pathsFile = path.join(config.CACHE_DIR, `device-pl-paths-${Date.now()}.json`);
-  fs.writeFileSync(pathsFile, JSON.stringify(safe), 'utf8');
-  const outFile = path.join(config.CACHE_DIR, `device-pl-del-${Date.now()}.json`);
-
-  const esc = s => s.replace(/'/g, "''");
-  const psCmd = `& '${esc(scriptPath)}' -PathsFile '${esc(pathsFile)}' -OutFile '${esc(outFile)}'`;
-  const psArgs = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psCmd];
-
-  const stdoutChunks = [], stderrChunks = [];
-  const ps = spawn('powershell.exe', psArgs, { windowsHide: true });
-  ps.stdout.on('data', d => stdoutChunks.push(d));
-  ps.stderr.on('data', d => stderrChunks.push(d));
-
-  // Generous timeout — MTP deletes can be slow if there are many files or
-  // if Windows shows internal confirmation prompts (suppressed in script).
-  const killTimer = setTimeout(() => {
-    ps.kill();
-    try { fs.unlinkSync(pathsFile); } catch (_) {}
-    try { fs.unlinkSync(outFile);   } catch (_) {}
-    if (!res.headersSent) res.status(504).json({ ok: false, error: 'Delete timed out after 3 min.' });
-  }, 180_000);
-
-  ps.on('close', exitCode => {
-    clearTimeout(killTimer);
-    if (res.headersSent) return;
-    let result = null;
-    try { if (fs.existsSync(outFile)) result = JSON.parse(fs.readFileSync(outFile, 'utf8').replace(/^﻿/, '').trim()); }
-    catch (_) {}
-    try { fs.unlinkSync(pathsFile); } catch (_) {}
-    try { fs.unlinkSync(outFile);   } catch (_) {}
-
-    if (!result) {
-      const stderr = Buffer.concat(stderrChunks).toString('utf8').trim().slice(-400);
-      return res.status(500).json({ ok: false, error: stderr || `Script exited with code ${exitCode}` });
-    }
-
-    try {
-      const db = require('../lib/db');
-      db.logActivity('quarantine', 'device-playlists-cleaned', null, {
-        deleted: result.deleted || [],
-        errors:  result.errors  || [],
-        total:   result.total   || 0,
-      });
-    } catch (_) {}
-
-    res.json(result);
-  });
+  const safe = paths
+    .filter(p => typeof p === 'string')
+    .map(p => p.replace(/\\/g, '/'))
+    .filter(p => !p.split('/').includes('..') && /\.m3u8?$/i.test(p) && /(^|\/)Playlists\//i.test(p));
+  if (safe.length === 0) return res.status(400).json({ ok: false, error: 'No valid playlist paths' });
+  try {
+    const db = require('../lib/db');
+    db.enqueueDevice(safe.map(relPath => ({ kind: 'playlist', action: 'delete', relPath })));
+    db.logActivity('quarantine', 'device-playlists-delete-queued', null, { paths: safe });
+    res.json({ ok: true, queued: true, deleted: [], errors: [], total: safe.length,
+      message: `Queued ${safe.length} playlist deletion(s). The R4 removes them on its next sync.` });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Could not queue deletions' });
+  }
 });
 
 // ── Filter logic ──────────────────────────────────────────────────────────────

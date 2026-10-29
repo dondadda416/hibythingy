@@ -2,8 +2,7 @@
 // ── Settings route ──────────────────────────────────────────────────────────
 // In-app editor for the variables that live in .env (and a handful that live
 // in config.js). Reads sanitised values, writes back preserving comments and
-// key order. Path settings that live in config.js (INBOX_PATH, LIBRARY_PATH,
-// DEVICE_NAME) get rewritten there too.
+// key order. Path settings are stored as HUB_INBOX_PATH / HUB_LIBRARY_PATH.
 //
 // API keys are masked on read — UI shows last 4 chars + ••••. To rotate, the
 // user supplies a new value; sending an empty string clears the key.
@@ -18,7 +17,6 @@ const { SettingsBody } = require('../lib/schemas');
 const env = require('../lib/envFile');
 
 const ENV_PATH    = path.join(__dirname, '..', '.env');
-const CONFIG_PATH = path.join(__dirname, '..', 'config.js');
 
 // Mask a secret for display — keep last 4 chars so the user can recognise it
 // without seeing the whole value.
@@ -69,6 +67,12 @@ router.get('/', (req, res) => {
       BASIC_AUTH_PASS_set: envHas('BASIC_AUTH_PASS'),
       BASIC_AUTH_PASS_masked: maskSecret(config.BASIC_AUTH_PASS),
     },
+    wheelhouse: {
+      WHEELHOUSE_TOKEN_set:    !!config.WHEELHOUSE_TOKEN,
+      WHEELHOUSE_TOKEN_masked: maskSecret(config.WHEELHOUSE_TOKEN),
+      R2_configured:           require('../lib/r2').isConfigured(config),
+      R2_BUCKET:               (config.R2 && config.R2.BUCKET) || '',
+    },
   });
 });
 
@@ -79,35 +83,19 @@ router.get('/', (req, res) => {
 // values until the next start; the UI nudges the user to restart.
 router.post('/', validateBody(SettingsBody), (req, res) => {
   const body = req.body;
-  // Path settings live in config.js — rewrite that file's relevant lines too.
-  let configChanged = false;
-  let configSrc = '';
-  try { configSrc = fs.readFileSync(CONFIG_PATH, 'utf8'); }
-  catch (e) {
-    return res.status(500).json({ error: 'Could not read config.js' });
-  }
-
-  function patchConfigJs(key, val) {
-    if (val == null) return;
-    // Match `KEY: 'xxx',` or `KEY: "xxx",` (handles backslashes inside quotes).
-    const re = new RegExp(`(\\b${key}\\s*:\\s*)(['"])((?:\\\\.|(?!\\2).)*)\\2`);
-    const escaped = String(val).replace(/'/g, "\\'");
-    const replacement = `$1'${escaped}'`;
-    if (re.test(configSrc)) {
-      const next = configSrc.replace(re, replacement);
-      if (next !== configSrc) { configSrc = next; configChanged = true; }
-    }
-  }
-  if (body.INBOX_PATH   !== undefined) patchConfigJs('INBOX_PATH',   body.INBOX_PATH);
-  if (body.LIBRARY_PATH !== undefined) patchConfigJs('LIBRARY_PATH', body.LIBRARY_PATH);
-  if (body.DEVICE_NAME  !== undefined) patchConfigJs('DEVICE_NAME',  body.DEVICE_NAME);
+  // Paths are environment settings too (HUB_INBOX_PATH / HUB_LIBRARY_PATH).
+  const PATH_KEYS = { INBOX_PATH: 'HUB_INBOX_PATH', LIBRARY_PATH: 'HUB_LIBRARY_PATH', DEVICE_NAME: 'DEVICE_NAME' };
 
   // Everything else lives in .env — apply diff.
   const envUpdates = {};
+  for (const [k, envKey] of Object.entries(PATH_KEYS)) {
+    if (body[k] !== undefined) envUpdates[envKey] = body[k];
+  }
   for (const k of [
     'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL', 'LASTFM_API_KEY', 'LASTFM_USERNAME',
     'HIBYHUB_CONTACT_EMAIL', 'DEVICE_MUSIC_FOLDER', 'DAILY_AI_BUDGET_USD', 'PORT',
     'HUB_TRUST_PROXY', 'ALLOWED_ORIGINS', 'BASIC_AUTH_USER', 'BASIC_AUTH_PASS',
+    'WHEELHOUSE_TOKEN',
   ]) {
     if (Object.prototype.hasOwnProperty.call(body, k)) {
       // Coerce booleans → "true"/"false" strings so .env stays text-only.
@@ -116,13 +104,7 @@ router.post('/', validateBody(SettingsBody), (req, res) => {
     }
   }
 
-  // Atomic writes. config.js first (less critical — empty .env just = no key).
   try {
-    if (configChanged) {
-      const tmp = CONFIG_PATH + '.' + process.pid + '.tmp';
-      fs.writeFileSync(tmp, configSrc, 'utf8');
-      fs.renameSync(tmp, CONFIG_PATH);
-    }
     if (Object.keys(envUpdates).length > 0) {
       const lines = env.readEnv(ENV_PATH);
       env.atomicWriteEnvSync(ENV_PATH, env.applyUpdates(lines, envUpdates));
@@ -136,9 +118,7 @@ router.post('/', validateBody(SettingsBody), (req, res) => {
   try {
     const db = require('../lib/db');
     db.logActivity('system', 'settings-changed', null, {
-      changedKeys: Object.keys(envUpdates).concat(
-        ['INBOX_PATH','LIBRARY_PATH','DEVICE_NAME'].filter(k => body[k] !== undefined)
-      ),
+      changedKeys: Object.keys(envUpdates),
     });
   } catch (_) {}
 

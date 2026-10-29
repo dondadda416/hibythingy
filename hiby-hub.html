@@ -1385,7 +1385,15 @@
           <div class="dropzone-inner">
             <div class="dropzone-icon" aria-hidden="true">⬇</div>
             <div class="dropzone-title" id="dropzone-title">Drop a folder to import</div>
-            <div class="dropzone-sub"  id="dropzone-sub">Hub will copy it into your inbox, ready for the wizard.</div>
+            <div class="dropzone-sub"  id="dropzone-sub">Hub will upload it to your inbox, ready for the wizard.</div>
+            <div class="dropzone-pick" style="margin-top:8px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+              <label class="btn btn-sm" style="cursor:pointer">📁 Choose folder…
+                <input type="file" id="dropzone-pick-folder" webkitdirectory directory multiple hidden onchange="_dropzonePick(this)">
+              </label>
+              <label class="btn btn-sm" style="cursor:pointer">🎵 Choose files…
+                <input type="file" id="dropzone-pick-files" multiple accept="audio/*,.flac,.m4a,.mp3,.wav,.aiff,.ape,.alac,.dsf,.dff,.jpg,.jpeg,.png,.cue,.lrc,.log" hidden onchange="_dropzonePick(this)">
+              </label>
+            </div>
           </div>
         </div>
 
@@ -1448,7 +1456,7 @@
               <div style="font-size:12px;color:var(--muted);padding:10px">Loading…</div>
             </div><!-- /home-inbox-list -->
             <div style="margin-top:10px;display:flex;gap:8px">
-              <button class="btn btn-primary btn-sm" onclick="LIVE_MODE ? launchApp('mp3tag') : alert('Start Hub via start.bat to launch Mp3tag.')">🏷 Open Mp3tag</button>
+              <button class="btn btn-primary btn-sm" onclick="LIVE_MODE ? launchApp('mp3tag') : alert('Mp3tag only works when Hub runs on your PC.')">🏷 Open Mp3tag</button>
               <button class="btn btn-ghost btn-sm" onclick="navigate('library', document.querySelector('[data-page=library]'))">Browse Inbox</button>
             </div>
           </div>
@@ -1499,7 +1507,7 @@
           <div class="card card-elevated">
             <div class="section-title mb-12">Quick Actions</div>
             <div style="display:flex;flex-direction:column;gap:8px">
-              <button class="btn btn-primary btn-block" onclick="LIVE_MODE ? launchApp('mp3tag') : alert('Start Hub via start.bat to launch Mp3tag.')">🏷 Open Mp3tag — tag & organize new downloads</button>
+              <button class="btn btn-primary btn-block" onclick="LIVE_MODE ? launchApp('mp3tag') : alert('Mp3tag only works when Hub runs on your PC.')">🏷 Open Mp3tag — tag & organize new downloads</button>
               <a class="btn btn-success btn-block" href="#sync">⬆ Sync new albums to HiBy</a>
               <a class="btn btn-ghost btn-block" href="#sync">🔍 Review what's missing from device</a>
               <a class="btn btn-ghost btn-block" href="#software">📥 Open Soulseek — browse server</a>
@@ -3183,7 +3191,8 @@
   // ════════════════════════════════════════════════════════════════════════════
   // Drop a folder from File Explorer onto the inbox dropzone. We walk the
   // dropped FileSystemEntry tree client-side and POST each file to
-  // /api/inbox/import-file with its X-Rel-Path header. Files cap at 200 MB.
+  // /api/inbox/import-file with its X-Rel-Path header. Files cap at 95 MB
+  // (Cloudflare's per-request limit is 100 MB).
 
   let _dropzoneBusy = false;
 
@@ -3203,7 +3212,7 @@
     const dz = document.getElementById('inbox-dropzone');
     if (dz) dz.classList.remove('dragover');
     if (_dropzoneBusy) return;
-    if (!LIVE_MODE) { alert('Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Hub server is not reachable.'); return; }
 
     // Collect every FileSystemEntry from the drop. webkitGetAsEntry exposes
     // both files and directories; getAsFile alone wouldn't see folder names.
@@ -3227,41 +3236,89 @@
       // Flatten — collect every file and its path relative to the drop root.
       const files = [];
       for (const e of entries) await _walkDropEntry(e, '', files);
-      if (files.length === 0) {
-        _setDropzoneStatus('Nothing to import', 'The dropped folder is empty.');
-        return;
-      }
-
-      // Use the first segment of the first file as the folder name shown to
-      // the user (matches how the inbox lists albums).
-      const rootName = files[0].relPath.split('/')[0];
-
-      // Upload sequentially so the progress bar reads correctly. Network is
-      // localhost; sequential is fine.
-      _renderDropzoneProgress(0, files.length);
-      let i = 0;
-      for (const f of files) {
-        const file = await _readFile(f.entry);
-        await _uploadDropFile(f.relPath, file);
-        i++;
-        _renderDropzoneProgress(i, files.length, f.relPath);
-      }
-
-      await apiPost('/api/inbox/import-done', { folderName: rootName, fileCount: files.length });
-      _setDropzoneStatus(`✓ Imported "${rootName}"`, `${files.length} file${files.length === 1 ? '' : 's'} copied to your inbox.`);
-
-      // Refresh the inbox list so the new folder appears.
-      try { await loadInboxList(); } catch (_) {}
-      try { await refreshAll(); } catch (_) {}
+      for (const f of files) f.file = await _readFile(f.entry);
+      await _uploadToInbox(files);
     } catch (err) {
       console.error('drop import:', err);
       _setDropzoneStatus('Import failed', err.message || String(err));
     } finally {
       _dropzoneBusy = false;
       if (dz) dz.classList.remove('uploading');
-      // Auto-reset the status after a few seconds.
-      setTimeout(() => _setDropzoneStatus('Drop a folder to import', 'Hub will copy it into your inbox, ready for the wizard.'), 6000);
+      setTimeout(_resetDropzoneStatus, 8000);
     }
+  }
+
+  // "Choose folder…" / "Choose files…" — the phone-friendly way in. A folder
+  // pick keeps its structure (webkitRelativePath); loose files from a phone
+  // go into a folder named for today's upload so the wizard sees one album.
+  async function _dropzonePick(input) {
+    const picked = Array.from(input.files || []);
+    input.value = '';
+    if (picked.length === 0 || _dropzoneBusy) return;
+    const dz = document.getElementById('inbox-dropzone');
+    _dropzoneBusy = true;
+    if (dz) dz.classList.add('uploading');
+    try {
+      const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '.');
+      const files = picked.map(f => ({
+        file: f,
+        relPath: f.webkitRelativePath ? f.webkitRelativePath : `Upload ${stamp}/${f.name}`,
+      }));
+      await _uploadToInbox(files);
+    } catch (err) {
+      console.error('pick import:', err);
+      _setDropzoneStatus('Import failed', err.message || String(err));
+    } finally {
+      _dropzoneBusy = false;
+      if (dz) dz.classList.remove('uploading');
+      setTimeout(_resetDropzoneStatus, 8000);
+    }
+  }
+
+  function _resetDropzoneStatus() {
+    _setDropzoneStatus('Drop a folder to import', 'Hub will upload it to your inbox, ready for the wizard.');
+    const bar = document.querySelector('#inbox-dropzone .dropzone-progress');
+    if (bar) bar.remove();
+  }
+
+  // Cloudflare (which sits in front of the Hub) refuses uploads over 100 MB
+  // per request, so anything bigger is skipped with a clear note.
+  const UPLOAD_MAX_BYTES = 95 * 1024 * 1024;
+  const UPLOAD_PARALLEL  = 3;
+
+  // files: [{ file: File, relPath: 'Folder/sub/name.flac' }]
+  async function _uploadToInbox(files) {
+    const junk = /(^|\/)(\.DS_Store|Thumbs\.db|desktop\.ini)$/i;
+    files = files.filter(f => !junk.test(f.relPath));
+    if (files.length === 0) {
+      _setDropzoneStatus('Nothing to import', 'No files found.');
+      return;
+    }
+    const tooBig = files.filter(f => f.file.size > UPLOAD_MAX_BYTES);
+    const toSend = files.filter(f => f.file.size <= UPLOAD_MAX_BYTES);
+    const rootName = files[0].relPath.split('/')[0];
+
+    let done = 0;
+    _renderDropzoneProgress(0, toSend.length);
+    const queue = toSend.slice();
+    async function worker() {
+      while (queue.length) {
+        const f = queue.shift();
+        await _uploadDropFile(f.relPath, f.file);
+        done++;
+        _renderDropzoneProgress(done, toSend.length, f.relPath);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(UPLOAD_PARALLEL, toSend.length) }, worker));
+
+    await apiPost('/api/inbox/import-done', { folderName: rootName, fileCount: toSend.length });
+    const skippedNote = tooBig.length
+      ? ` Skipped ${tooBig.length} file${tooBig.length === 1 ? '' : 's'} over 95 MB (Cloudflare's upload limit): ${tooBig.map(f => f.relPath.split('/').pop()).join(', ')}.`
+      : '';
+    _setDropzoneStatus(`✓ Imported "${rootName}"`,
+      `${toSend.length} file${toSend.length === 1 ? '' : 's'} uploaded to your inbox.` + skippedNote);
+    try { await loadInboxList(); } catch (_) {}
+    try { await refreshAll(); } catch (_) {}
   }
 
   function _setDropzoneStatus(title, sub) {
@@ -3780,16 +3837,19 @@
     if (device && device.connected) {
       if (dot)  { dot.className = 'device-dot connected'; }
       if (name) name.textContent = device.name || 'HiBy R4';
-      if (sub)  sub.textContent  = 'USB Connected';
+      const q = device.queued ? ` · ${device.queued} queued` : '';
+      if (sub)  sub.textContent  = 'Online (Wheelhouse)' + q;
       if (homeDot)   { homeDot.style.background = 'var(--green)'; }
-      if (homeLabel) homeLabel.textContent = 'HiBy R4 — Connected via USB';
+      if (homeLabel) homeLabel.textContent = 'HiBy R4 — online via Wheelhouse' + q;
       if (devBadge)  { devBadge.className = 'badge badge-green'; devBadge.textContent = '● Connected'; }
     } else if (device && device.connected === false) {
       if (dot)  { dot.className = 'device-dot'; dot.style.background = 'var(--muted)'; }
       if (name) name.textContent = 'HiBy R4';
-      if (sub)  sub.textContent  = 'Not connected';
+      const seen = device.lastSeen ? 'Last sync ' + new Date(device.lastSeen).toLocaleString() : 'Wheelhouse not set up yet';
+      const q = device.queued ? ` · ${device.queued} queued` : '';
+      if (sub)  sub.textContent  = seen + q;
       if (homeDot)   { homeDot.style.background = 'var(--muted)'; }
-      if (homeLabel) homeLabel.textContent = 'HiBy R4 — Not connected';
+      if (homeLabel) homeLabel.textContent = 'HiBy R4 — offline (' + seen + ')' + q;
       if (devBadge)  { devBadge.className = 'badge badge-muted'; devBadge.textContent = 'Not connected'; }
     } else {
       if (sub)       sub.textContent = 'Unknown';
@@ -3927,7 +3987,7 @@
     window._backlogMap = {};
     tbody.innerHTML = backlog.map((album, idx) => {
       const folderName  = album.name || album.key || '';
-      const sourcePath  = album.path || (config_LIBRARY_PATH + '\\' + folderName);
+      const sourcePath  = album.path || (config_LIBRARY_PATH + (config_LIBRARY_PATH.includes('\\') ? '\\' : '/') + folderName);
       const artist      = album.artist || folderName.split(/\s*[-–—]\s*/)[0] || folderName;
       const albumName   = album.album  || folderName.split(/\s*[-–—]\s*/).slice(1).join(' - ') || folderName;
       window._backlogMap[idx] = { sourcePath, artist, albumName, folderName, path: album.path };
@@ -4211,7 +4271,7 @@
   // ── Topbar scan buttons ────────────────────────────────────────────────────
   async function triggerLibraryScan() {
     if (!LIVE_MODE) {
-      alert('Backend not running — open http://localhost:3847 or run start.bat first.');
+      alert('Backend not running — open http://localhost:3847 or check the server.');
       return;
     }
     const btn = document.getElementById('btn-scan-library');
@@ -4270,7 +4330,7 @@
   }
 
   async function detectDeviceName() {
-    if (!LIVE_MODE) { alert('Backend not running. Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Backend not running. Hub server is not reachable.'); return; }
     const resultEl = document.getElementById('device-detect-result');
     const btn      = document.getElementById('btn-detect-device');
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Detecting…'; }
@@ -4290,7 +4350,7 @@
 
   // "Refresh device" — reads the push log (instant, no MTP scan needed)
   async function triggerDeviceScan() {
-    if (!LIVE_MODE) { alert('Backend not running. Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Backend not running. Hub server is not reachable.'); return; }
     // Update every "Refresh Device" button to show loading state
     const btns = document.querySelectorAll('[onclick*="triggerDeviceScan"]');
     btns.forEach(b => { b._origText = b.textContent; b.textContent = '⏳ Refreshing…'; b.disabled = true; });
@@ -4330,7 +4390,7 @@
 
   // Clear push log with confirmation
   async function clearPushLog() {
-    if (!LIVE_MODE) { alert('Backend not running. Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Backend not running. Hub server is not reachable.'); return; }
     if (!confirm('Clear the push log? This removes the record of what has been synced to your HiBy. It does NOT delete files from the device.')) return;
     try {
       await fetch('/api/device/pushed', { method: 'DELETE' });
@@ -4355,13 +4415,13 @@
   }
 
   async function triggerMtpScan() {
-    if (!LIVE_MODE) { alert('Backend not running. Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Backend not running. Hub server is not reachable.'); return; }
     if (!confirm('Start a full MTP device scan?\n\nThis can take 1–5 minutes — keep Hub open until it finishes. Cancel any other USB transfers first.')) return;
-    _deviceScanStatus('📡 Connecting to HiBy R4 via USB — this can take 1–5 minutes for large collections. Keep Hub open…', 'info');
+    _deviceScanStatus('📡 Asking the R4 for its album list — open Wheelhouse on the R4 with Wi‑Fi on. It reports in on its next sync.', 'info');
 
     // Also update library page sub-label if visible
     const subEl = document.getElementById('lib-device-sub');
-    if (subEl) subEl.textContent = 'Scanning via USB…';
+    if (subEl) subEl.textContent = 'Waiting for Wheelhouse…';
 
     try {
       const startRes = await apiPost('/api/device/scan');
@@ -4370,10 +4430,10 @@
       const poll = async () => {
         elapsed += 5;
         if (elapsed > 360) {
-          _deviceScanStatus('⚠️ Scan timed out after 6 minutes. Make sure the R4 is connected via USB in MTP mode (not just charging), then try again.', 'warn');
+          _deviceScanStatus('⚠️ The R4 hasn’t reported in yet. Open Wheelhouse on the R4 (Wi‑Fi on); the request stays open and the list updates when it syncs.', 'warn');
           return;
         }
-        _deviceScanStatus(`📡 Scanning device via USB… (${elapsed}s elapsed)`, 'info');
+        _deviceScanStatus(`📡 Waiting for Wheelhouse on the R4… (${elapsed}s)`, 'info');
         await new Promise(r => setTimeout(r, 5000));
         const s = await apiGet('/api/device/scan-status');
 
@@ -4381,16 +4441,16 @@
           // Still running
           poll();
         } else if (s.status === 'error') {
-          _deviceScanStatus('❌ Scan error: ' + (s.error || 'unknown error') + ' — check the cmd window for details.', 'error');
+          _deviceScanStatus('❌ Scan error: ' + (s.error || 'unknown error'), 'error');
         } else if (s.status === 'done') {
           if (!s.connected) {
-            _deviceScanStatus('⚠️ Device not found via MTP. Make sure the R4 is unlocked, USB mode is set to MTP (not charging), then try again.', 'warn');
+            _deviceScanStatus('⚠️ The R4 did not report in.', 'warn');
           } else if (s.albumCount === 0) {
-            _deviceScanStatus('✅ Scan complete — device connected but no albums found in Music folder. Your music may be in a different folder.', 'ok');
+            _deviceScanStatus('✅ Wheelhouse reported in, but no albums were found on the R4.', 'ok');
           } else {
             await loadDeviceAlbums();
             await refreshAll();
-            _deviceScanStatus(`✅ Scan complete — found ${s.albumCount} albums on your R4. Push log updated.`, 'ok');
+            _deviceScanStatus(`✅ Wheelhouse reported ${s.albumCount} albums on your R4.`, 'ok');
           }
         } else {
           poll();
@@ -4406,7 +4466,7 @@
 
   // ── Software launch buttons ────────────────────────────────────────────────
   async function launchApp(appKey) {
-    if (!LIVE_MODE) { alert('Backend not running. Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Backend not running. Hub server is not reachable.'); return; }
     const labels = { mp3tag: 'Mp3tag', soulseek: 'Soulseek', picard: 'MusicBrainz Picard', foobar: 'foobar2000', freac: 'fre:ac' };
     const label = labels[appKey] || appKey;
     _toast(`Launching ${label}…`, 'info', 2000);
@@ -4467,7 +4527,7 @@
 
     try {
       if (!LIVE_MODE) {
-        container.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:12px">Start Hub via start.bat to see real inbox folders.</div>';
+        container.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:12px">Hub server is not reachable.</div>';
         return;
       }
       const data = await apiGet('/api/inbox' + (window._inboxOverrideAll ? '?all=1' : ''));
@@ -5309,7 +5369,7 @@
   // .m3u8 twin, "name 1" auto-suffix forms), and lets the user confirm
   // before MTP deletion.
   async function openCleanDevicePlaylists(btnEl) {
-    if (!LIVE_MODE) { alert('Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Hub server is not reachable.'); return; }
     const panel = document.getElementById('pl-clean-panel');
     if (!panel) return;
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Scanning…'; }
@@ -5419,6 +5479,11 @@
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Deleting…'; }
     try {
       const r = await apiPost('/api/playlist/device-delete', { paths });
+      if (r.ok && r.queued) {
+        _toast(`🗑 ${r.message || 'Deletion queued for the R4.'}`, 'ok', 8000);
+        if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Delete selected'; }
+        return;
+      }
       const okCount  = (r.deleted || []).length;
       const errCount = (r.errors  || []).length;
       if (errCount === 0 && okCount > 0) {
@@ -5448,7 +5513,7 @@
   }
 
   async function pushPlaylistToDevice(name, btnEl) {
-    if (!LIVE_MODE) { alert('Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Hub server is not reachable.'); return; }
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Pushing…'; }
     try {
       // 130s budget — matches the server's 120s PowerShell timeout plus 10s
@@ -5462,7 +5527,10 @@
         signal: AbortSignal.timeout(130000),
       });
       const result = await r.json();
-      if (result.ok) {
+      if (result.ok && result.queued) {
+        _toast(`📥 "${name}" queued for the R4 — it downloads the next time Wheelhouse syncs.`, 'ok', 8000);
+        if (btnEl) { btnEl.disabled = false; btnEl.textContent = '📥 Queued'; }
+      } else if (result.ok) {
         // Show where the playlist actually landed — and the manual-import nudge.
         const where = (result.pushed && result.pushed.length)
           ? result.pushed.map(p => `SD:\\${p}`).join(', ')
@@ -5494,7 +5562,7 @@
         console.error('[playlist-push] failed:', err);
       }
     } catch (e) {
-      const msg = e.name === 'TimeoutError' ? 'Timed out — is the HiBy connected via USB in MTP mode?' : e.message;
+      const msg = e.name === 'TimeoutError' ? 'Timed out talking to the Hub.' : e.message;
       _toast('Push error: ' + msg, 'error', 15000);
       if (btnEl) {
         btnEl.disabled = false;
@@ -6538,7 +6606,7 @@
       // Backend not running — stay in demo mode
       LIVE_MODE = false;
       setBackendStatus(false, '○ Demo mode');
-      console.info('HiBy Hub: demo mode (backend not reachable). Run start.bat to go live.');
+      console.info('HiBy Hub: demo mode (backend not reachable). Check the server.');
     }
   }
 
@@ -6564,7 +6632,7 @@
 
   // ── Open / close ──────────────────────────────────────────────────────────
   function openWizard(folders) {
-    if (!LIVE_MODE) { alert('Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Hub server is not reachable.'); return; }
 
     // If folders supplied, use them; otherwise re-fetch from API
     if (folders && folders.length > 0) {
@@ -7345,7 +7413,7 @@
   // Wraps the same /api/device/push-batch endpoint pushAllBacklog uses so the
   // backend stays on a single code path. Reuses the existing push-progress UI.
   async function pushSelectedBacklog(btnEl) {
-    if (!LIVE_MODE) { alert('Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Hub server is not reachable.'); return; }
     const rows = Array.from(document.querySelectorAll('.backlog-cb:checked'));
     if (rows.length === 0) return;
     const entries = rows
@@ -7360,8 +7428,9 @@
       const albums = entries.map(e => ({
         sourcePath: e.sourcePath, artist: e.artist, album: e.albumName, force: false,
       }));
-      await apiPost('/api/device/push-batch', { albums });
-      _syncStatus(`✓ ${entries.length} push job${entries.length !== 1 ? 's' : ''} queued. Watch the Jobs page for progress.`, 'ok');
+      const result = await apiPost('/api/device/push-batch', { albums });
+      if (result && result.queued) _showQueuedResult(result, null, '');
+      else _syncStatus(`✓ ${entries.length} push job${entries.length !== 1 ? 's' : ''} queued. Watch the Jobs page for progress.`, 'ok');
       clearBacklogSelection();
       setTimeout(() => refreshSyncBacklog(), 1500);
     } catch (e) {
@@ -7983,7 +8052,7 @@
   // Hub thinks it pushed but the device can't find. Offers to prune those
   // entries so they flow back into the backlog for re-pushing.
   async function verifyPushLog(btnEl) {
-    if (!LIVE_MODE) { alert('Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Hub server is not reachable.'); return; }
     const originalLabel = btnEl ? btnEl.textContent : null;
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Verifying…'; }
     try {
@@ -8030,7 +8099,7 @@
   }
 
   async function pushAllBacklog(btnEl) {
-    if (!LIVE_MODE) { alert('Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Hub server is not reachable.'); return; }
 
     // Read only what's currently rendered in the table (not stale _backlogMap)
     const rows = document.querySelectorAll('#sync-backlog-tbody tr[data-idx]');
@@ -8052,6 +8121,10 @@
     try {
       const result = await apiPost('/api/device/push-batch', { albums });
       if (!result.ok) throw new Error(result.error || 'Batch push failed');
+      if (result.queued) {
+        _showQueuedResult(result, btnEl, '⬆ Push All to HiBy');
+        return;
+      }
 
       _syncStatus(`⏳ Transferring ${entries.length} album${entries.length !== 1 ? 's' : ''} to HiBy… check Jobs & Logs for progress.`, 'info');
 
@@ -8098,7 +8171,7 @@
 
   // Push a single album from master library → HiBy SD card
   async function pushAlbumToDevice(sourcePath, artist, albumName, btnEl) {
-    if (!LIVE_MODE) { alert('Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Hub server is not reachable.'); return; }
 
     // Derive display name from the path's last segment
     const displayName = sourcePath.split(/[\\/]/).pop() || albumName;
@@ -8118,6 +8191,13 @@
         return;
       }
 
+      if (result.ok && result.queued) {
+        if (btnEl) { btnEl.textContent = '📥 Queued for R4'; btnEl.disabled = false; btnEl.style.background = 'var(--blue, var(--accent))'; }
+        _syncStatus(`📥 ${result.message || 'Queued for the R4.'}`, 'ok');
+        const row = btnEl && btnEl.closest('tr');
+        if (row) row.style.opacity = '0.6';
+        return;
+      }
       if (result.ok || result.status === 'running') {
         pollPushJob(result.jobId, displayName, btnEl);
       } else {
@@ -8131,12 +8211,29 @@
     }
   }
 
+  // Push now means "queue for Wheelhouse": the R4 downloads over Wi-Fi on its
+  // next sync, so there's nothing to poll. Show what was queued and move on.
+  function _showQueuedResult(result, btnEl, resetLabel) {
+    const n = result.total || 0;
+    const extra = [];
+    if (result.skipped) extra.push(`${result.skipped} already on the R4`);
+    if (result.problems && result.problems.length) extra.push(`${result.problems.length} couldn't be queued (${result.problems[0].error})`);
+    const msg = (n ? `📥 Queued ${n} album${n === 1 ? '' : 's'} for the R4 — they download the next time Wheelhouse syncs.` : `ℹ️ ${result.message || 'Nothing to queue.'}`)
+      + (extra.length ? ' ' + extra.join('; ') + '.' : '');
+    _syncStatus(msg, (result.problems && result.problems.length) ? 'warn' : 'ok');
+    if (btnEl) {
+      btnEl.textContent = n ? `📥 ${n} queued` : '✓ Nothing to do';
+      setTimeout(() => { btnEl.textContent = resetLabel; btnEl.style.background = ''; btnEl.disabled = false; }, 4000);
+    }
+    setTimeout(() => { try { refreshSyncBacklog(); } catch (_) {} }, 1500);
+  }
+
   // Poll /api/device/push until job is done or errored
   async function pollPushJob(jobId, displayName, btnEl, attempts) {
     attempts = attempts || 0;
     if (attempts > 90) {
       if (btnEl) { btnEl.textContent = '⏳ Still transferring…'; btnEl.disabled = false; }
-      _syncStatus('⚠️ Push is taking a long time — check the cmd window for progress.', 'warn');
+      _syncStatus('⚠️ Push is taking a long time — check Jobs & Logs.', 'warn');
       return;
     }
     await new Promise(r => setTimeout(r, 10000));
@@ -8165,7 +8262,7 @@
 
   // ── Wizard "Sync to HiBy" — pushes all just-processed albums ─────────────
   async function wizSyncToHiBy() {
-    if (!LIVE_MODE) { alert('Start Hub via start.bat first.'); return; }
+    if (!LIVE_MODE) { alert('Hub server is not reachable.'); return; }
     if (!_wiz.processed || _wiz.processed.length === 0) {
       alert('No albums to sync — nothing was processed.');
       return;
@@ -8174,7 +8271,7 @@
     const albums = _wiz.processed
       .filter(f => f.ok)
       .map(f => ({
-        sourcePath: f.movedTo || (config_LIBRARY_PATH + '\\' + f.newName),
+        sourcePath: f.movedTo || (config_LIBRARY_PATH + (config_LIBRARY_PATH.includes('\\') ? '\\' : '/') + f.newName),
         artist:     f.artist  || f.newName,
         album:      f.album   || f.newName,
       }));
@@ -8197,6 +8294,21 @@
       const result = await apiPost('/api/device/push-batch', { albums });
 
       if (!result.ok) throw new Error(result.error || 'Batch push failed');
+
+      if (result.queued) {
+        // Wheelhouse pulls over Wi-Fi — nothing to wait for here.
+        document.getElementById('wiz-sync-progress').style.display = 'none';
+        document.getElementById('wiz-sync-done').style.display = 'block';
+        totalBar.style.width = '100%';
+        const resultEl = document.getElementById('wiz-sync-result');
+        const n = result.total || 0;
+        resultEl.textContent = n
+          ? `📥 ${n} album${n !== 1 ? 's' : ''} queued for the R4 — they download the next time Wheelhouse syncs.`
+          : (result.message || 'Nothing to queue.');
+        resultEl.style.color = (result.problems && result.problems.length) ? 'var(--yellow)' : 'var(--green)';
+        setTimeout(refreshAll, 1500);
+        return;
+      }
 
       // Poll until all jobs complete
       const batchId = result.batchId;
@@ -8327,7 +8439,7 @@
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳'; }
 
     if (!LIVE_MODE) {
-      list.innerHTML = '<span style="color:var(--muted)">Start Hub via start.bat to see job status.</span>';
+      list.innerHTML = '<span style="color:var(--muted)">Hub server is not reachable.</span>';
       if (btnEl) { btnEl.disabled = false; btnEl.textContent = '↺ Refresh'; }
       _stopJobsPoll();
       return;
@@ -8411,7 +8523,7 @@
     if (!list) return;
 
     if (!LIVE_MODE) {
-      list.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:10px">Start Hub via start.bat to load your library.</div>';
+      list.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:10px">Hub server is not reachable.</div>';
       return;
     }
 
@@ -8484,7 +8596,7 @@
     if (!list) return;
 
     if (!LIVE_MODE) {
-      list.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:10px">Start Hub via start.bat to load device info.</div>';
+      list.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:10px">Hub server is not reachable.</div>';
       return;
     }
 

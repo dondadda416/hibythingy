@@ -1,4 +1,4 @@
-// ── HiBy Hub — Local Server ──────────────────────────────────────────────────
+// ── HiBy Hub — Server ────────────────────────────────────────────────────────
 'use strict';
 const express     = require('express');
 const cors        = require('cors');
@@ -7,7 +7,7 @@ const path        = require('path');
 const fs          = require('fs');
 const chokidar    = require('chokidar');
 const config      = require('./config');
-const { isWindows, platformLabel } = require('./lib/platform');
+const { platformLabel } = require('./lib/platform');
 const db          = require('./lib/db');
 const { migrateFromJson } = require('./lib/db-migrate');
 
@@ -44,6 +44,10 @@ app.use(cors({
 // both set; otherwise it's a no-op pass-through.
 const basicAuth = require('./lib/basicAuth').build(config);
 app.use(basicAuth);
+
+// Wheelhouse (the R4 app) authenticates with its own bearer token, so this
+// router sits outside Basic auth (see SKIP_PREFIXES in lib/basicAuth.js).
+const wheelhouseRoute = require('./routes/wheelhouse');
 
 app.use(compression());
 app.use(express.json({ limit: '1mb' }));
@@ -115,6 +119,7 @@ app.use('/api/lastfm',     lastfmRoute);
 app.use('/api/smart-playlists', smartPlaylistRoute);
 app.use('/api/activity',        activityRoute);
 app.use('/api/settings',        settingsRoute);
+app.use('/api/wheelhouse',      wheelhouseRoute);
 // Convenience alias so /api/setup-status hits the same handler.
 app.get('/api/setup-status', (req, res, next) => {
   req.url = '/setup-status';
@@ -213,13 +218,16 @@ app.get('/api/status', async (req, res) => {
 });
 
 // ── Background library auto-scan ─────────────────────────────────────────────
-const LIBRARY_SCAN_INTERVAL = 2 * 60 * 1000;
+// The library lives on an rclone mount of R2. Folder listings are cached by
+// rclone, and tags are only read for new/changed albums, so a scan is cheap,
+// but there's no reason to do it every couple of minutes either.
+const LIBRARY_SCAN_INTERVAL = Math.max(1, config.LIBRARY_SCAN_MINUTES || 15) * 60 * 1000;
 
 async function backgroundLibraryScan() {
   try {
     const result = await libraryRoute.scanLibrary();
     if (result.ok) {
-      console.log('[auto-scan] Library:', result.albumCount, 'albums,', result.trackCount, 'tracks');
+      console.log('[auto-scan] Library:', result.albumCount, 'albums,', result.trackCount, 'tracks,', result.genreReads, 'tag reads');
     }
   } catch (e) {
     console.warn('[auto-scan] Library scan error:', e.message);
@@ -234,14 +242,15 @@ setTimeout(() => {
 setTimeout(startInboxWatcher, 5000);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(config.PORT, () => {
+app.listen(config.PORT, config.HOST, () => {
   console.log('\n+==========================================+');
   console.log('|        HiBy Hub -- Control Center        |');
   console.log('+==========================================+');
-  console.log('\n  Dashboard: http://localhost:' + config.PORT);
+  console.log('\n  Dashboard: http://' + config.HOST + ':' + config.PORT);
   console.log('  Inbox:     ' + config.INBOX_PATH);
   console.log('  Library:   ' + config.LIBRARY_PATH);
-  console.log('  Device:    ' + config.DEVICE_NAME + ' (MTP via PowerShell)');
+  console.log('  Device:    ' + config.DEVICE_NAME + ' via Wheelhouse (' + (config.WHEELHOUSE_TOKEN ? 'token set' : 'WHEELHOUSE_TOKEN not set — sync off') + ')');
+  console.log('  Downloads: ' + (require('./lib/r2').isConfigured(config) ? 'signed R2 links (' + config.R2.BUCKET + ')' : 'streamed through Hub (R2 keys not set)'));
   console.log('  Platform:  ' + platformLabel());
   if (config.TRUST_PROXY) {
     console.log('  Proxy:     enabled (X-Forwarded-* trusted from loopback)');
@@ -251,9 +260,6 @@ app.listen(config.PORT, () => {
   }
   if (config.ALLOWED_ORIGINS && config.ALLOWED_ORIGINS.length > 0) {
     console.log('  Origins:   localhost + ' + config.ALLOWED_ORIGINS.join(', '));
-  }
-  if (!isWindows) {
-    console.log('  ⚠ Non-Windows host — device control + app launchers will return 503.');
   }
   if (!config.ANTHROPIC_API_KEY) {
     console.log('  ⚠ ANTHROPIC_API_KEY not set in .env — /api/identify disabled.');
