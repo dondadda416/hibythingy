@@ -18,14 +18,23 @@ Every request needs:
 Authorization: Bearer <WHEELHOUSE_TOKEN>
 ```
 
-The token is printed at the end of `deploy/setup.sh` and is stored as `WHEELHOUSE_TOKEN` in the server's `.env`. `/api/wheelhouse/*` has a Cloudflare Access **Bypass** rule, so the token is the only gate. Keep it secret.
+The token is printed at the end of `deploy/setup.sh` and is stored as `WHEELHOUSE_TOKEN` in the server's `.env`. Keep it secret.
+
+The Hub sits behind Cloudflare Access, so the R4 also sends an Access **service token** (Zero Trust → Access → Service credentials), allowed by a *Service Auth* policy on the Hub's Access application:
+
+```
+CF-Access-Client-Id: <client id>.access
+CF-Access-Client-Secret: <client secret>
+```
+
+Without those headers Access answers with a redirect to its login page.
 
 Optional headers on any call, which the dashboard shows:
 
 | Header | Example |
 |---|---|
 | `X-Device-Name` | `HiBy R4` |
-| `X-App-Version` | `1.3.0` |
+| `X-App-Version` | `Wheelhouse 1.10` |
 | `X-Free-MB` / `X-Total-MB` | `81234` / `243000` |
 
 Any authenticated call counts as a check-in. The dashboard shows the R4 as online when it has checked in within the last 10 minutes.
@@ -128,3 +137,21 @@ Redirects to a signed R2 link for one file. When R2 isn't configured, it streams
 4. Repeat `/sync` while `remaining > 0`.
 5. If `scanWanted` was set, or anything changed, `POST /inventory`.
 6. Ask Android's media scanner to rescan the folders that changed.
+
+## Wheelhouse 1.10 (the R4 side)
+
+Main menu → **Hub Sync**.
+
+- **Load hub.txt** reads settings from `hub.txt` in `Download/` or `Wheelhouse/` on the player:
+  ```
+  server=https://hiby.jp-copeland.com
+  token=<WHEELHOUSE_TOKEN>
+  cf_id=<Access client id>
+  cf_secret=<Access client secret>
+  ```
+  Each field can also be typed in on the Hub Sync screen.
+- **Music Folder**: picked once with Android's folder picker (internal storage or SD card). Albums land at `<folder>/<relPath>`, so pick the folder that should hold `Artist/Album` folders and `Playlists/`.
+- **Auto Sync** checks the Hub every 10 minutes while the app is open on unmetered Wi-Fi. **Sync Now** runs it straight away.
+- **Get Albums** lists the Hub library; pressing an album queues it (`POST /request`).
+- Files download as `name.part`, are checked against the expected size, then renamed. Files already present with the right size are skipped, so an interrupted album resumes.
+- After a sync Wheelhouse sends `/inventory`, asks the media scanner to index the new files, and rescans its own library.
