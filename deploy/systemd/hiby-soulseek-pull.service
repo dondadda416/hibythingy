@@ -1,0 +1,10 @@
+[Unit]
+Description=Pull new Soulseek downloads from R2 into the HiBy Hub inbox
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=hiby
+Group=hiby
+Environment=R2_BUCKET=@BUCKET@
+ExecStart=/opt/hiby-hub/deploy/soulseek-pull.sh

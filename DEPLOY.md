@@ -59,6 +59,19 @@ Keep your existing **HiBy Hub** Access application (email PIN) on `hiby.<your do
    `sudo systemctl restart hiby-hub`
 4. Open `https://hiby.<your domain>/connect` (Device page → **Connect R4**), download `hub.txt`, copy it to the R4's `Download` folder, and in Wheelhouse choose Hub → Set up → **Load hub.txt From Card**.
 
+## Soulseek downloads → Inbox
+
+Downloads on the PC reach the Hub's Inbox in two hops, so you still check tags before anything is filed:
+
+1. **PC → R2.** `scripts/soulseek-push.ps1` copies finished files from `Soulseek Downloads\complete` to `r2:hiby-library/soulseek` every 5 minutes (a scheduled task; files are copied, so Soulseek keeps sharing them). One-time setup on the PC, in the folder holding the script:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\soulseek-push.ps1 -Install
+   ```
+   It finds rclone, the downloads folder and the R2 remote by itself; `-Source`, `-Remote` and `-MaxAge` (default `30d`) override them. `-Uninstall` removes the task. Log: `%LOCALAPPDATA%\HiByHub\soulseek-push.log`.
+2. **R2 → Inbox.** `hiby-soulseek-pull.timer` runs `deploy/soulseek-pull.sh` every 3 minutes. It copies files it hasn't pulled before into `/srv/hiby/inbox` and lists them in `/srv/hiby/data/soulseek-pulled.txt`, so albums you file or delete never come back. To pull something again, delete its lines from that file.
+
+Check it: `systemctl list-timers hiby-soulseek-pull.timer` and `journalctl -u hiby-soulseek-pull -n 20`.
+
 ## Day to day
 
 | Task | Command |

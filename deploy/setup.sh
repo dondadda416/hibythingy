@@ -10,6 +10,7 @@
 #   hiby-hub.service       the Hub (Node) on 127.0.0.1:3847
 #   cloudflared            the tunnel that serves hiby.<your domain>
 #   hiby-backup.timer      nightly database backup to r2:<bucket>/backups
+#   hiby-soulseek-pull.timer  new Soulseek downloads (r2:<bucket>/soulseek) -> inbox
 #
 # Safe to re-run: existing settings in /opt/hiby-hub/.env are kept.
 # Any prompt can be pre-answered with an environment variable of the same name
@@ -185,6 +186,8 @@ sed -e "s#@BUCKET@#${R2_BUCKET}#g" "$APP_DIR/deploy/systemd/hiby-library.service
 cp "$APP_DIR/deploy/systemd/hiby-hub.service"    /etc/systemd/system/
 sed -e "s#@BUCKET@#${R2_BUCKET}#g" "$APP_DIR/deploy/systemd/hiby-backup.service" > /etc/systemd/system/hiby-backup.service
 cp "$APP_DIR/deploy/systemd/hiby-backup.timer"   /etc/systemd/system/
+sed -e "s#@BUCKET@#${R2_BUCKET}#g" "$APP_DIR/deploy/systemd/hiby-soulseek-pull.service" > /etc/systemd/system/hiby-soulseek-pull.service
+cp "$APP_DIR/deploy/systemd/hiby-soulseek-pull.timer" /etc/systemd/system/
 chmod +x "$APP_DIR/deploy/"*.sh
 systemctl daemon-reload
 systemctl enable --now hiby-library.service
@@ -194,6 +197,7 @@ findmnt -rn "$SRV/library" >/dev/null || die "The R2 mount didn't come up. See: 
 echo "    Library mounted: $(sudo -u "$SVC_USER" ls "$SRV/library" | wc -l) top-level folders."
 systemctl enable --now hiby-hub.service
 systemctl enable --now hiby-backup.timer
+systemctl enable --now hiby-soulseek-pull.timer
 
 if [ -n "${TUNNEL_TOKEN:-}" ]; then
   # Accept the whole "cloudflared.exe service install <token>" line the
