@@ -150,7 +150,7 @@ const identifyLimiter = rateLimit({
 });
 
 // Per-day cost cap (USD). Override via DAILY_AI_BUDGET_USD env var.
-const DAILY_BUDGET_USD = parseFloat(process.env.DAILY_AI_BUDGET_USD || '5');
+const dailyBudgetUSD = () => parseFloat(process.env.DAILY_AI_BUDGET_USD || '5') || 5;
 
 function dailyBudgetGuard(req, res, next) {
   try {
@@ -164,9 +164,9 @@ function dailyBudgetGuard(req, res, next) {
       // will treat the new window as starting now.
       return next();
     }
-    if ((u.costUSD || 0) >= DAILY_BUDGET_USD) {
+    if ((u.costUSD || 0) >= dailyBudgetUSD()) {
       return res.status(429).json({
-        error: `Daily AI budget reached ($${DAILY_BUDGET_USD.toFixed(2)}). Resets at ${new Date(reset.getTime() + 24*60*60*1000).toISOString()}`,
+        error: `Daily AI budget reached ($${dailyBudgetUSD().toFixed(2)}). Resets at ${new Date(reset.getTime() + 24*60*60*1000).toISOString()}`,
       });
     }
   } catch (_) {}

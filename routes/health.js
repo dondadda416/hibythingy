@@ -6,7 +6,6 @@ const fs           = require('fs');
 const fsp          = fs.promises;
 const path         = require('path');
 const mm           = require('music-metadata');
-const { execFile } = require('child_process');
 const config       = require('../config');
 const libraryRoute = require('./library');
 const { resolveUnder } = require('../lib/safePath');
@@ -290,19 +289,6 @@ router.get('/flac-integrity', async (req, res) => {
     items: issues,
     count: issues.length,
     note: 'Pure-JS check. For full bit-rot verification run `flac -t *.flac` externally.',
-  });
-});
-
-// POST /api/health/open-folder — open a folder in Windows Explorer
-// Body: { folderPath }
-router.post('/open-folder', require('../lib/platform').requireWindows('Opening folders'), validateBody(HealthFolderBody), (req, res) => {
-  const { folderPath: suppliedPath } = req.body;
-  const folderPath = resolveUnder(suppliedPath, [config.INBOX_PATH, config.LIBRARY_PATH]);
-  if (!folderPath) return res.status(403).json({ error: 'Path is outside managed folders' });
-
-  execFile('explorer.exe', [folderPath], () => {
-    // Explorer always returns a non-zero exit code — ignore it
-    res.json({ ok: true });
   });
 });
 

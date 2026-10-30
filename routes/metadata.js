@@ -69,23 +69,4 @@ router.get('/scan', async (req, res) => {
   });
 });
 
-// POST /api/metadata/open-mp3tag
-// Convenience: opens the album folder in Mp3tag (Windows only via explorer).
-// Body: { path }
-router.post('/open-mp3tag', require('../lib/platform').requireWindows('Opening Mp3tag'), (req, res) => {
-  const { path: albumPath } = req.body || {};
-  if (!albumPath || !fs.existsSync(albumPath)) {
-    return res.status(400).json({ error: 'Path not found' });
-  }
-  const { execFile } = require('child_process');
-  // Try Mp3tag first, fall back to opening folder in Explorer
-  execFile('Mp3tag.exe', [albumPath], { detached: true }, err => {
-    if (err) {
-      // Fall back to explorer
-      execFile('explorer.exe', [albumPath], { detached: true }, () => {});
-    }
-  });
-  res.json({ ok: true });
-});
-
 module.exports = router;

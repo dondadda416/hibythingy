@@ -142,7 +142,7 @@ Redirects to a signed R2 link for one file. When R2 isn't configured, it streams
 
 Main menu → **Hub**.
 
-**Setting up.** Open `/connect` on the Hub (Device page → **Connect R4**). It shows a setup code (`WH1:` + base64url JSON `{u, t, ci, cs}`: Hub address, Wheelhouse token, Access client id and secret) and offers it as `hub.txt`. On the R4: Hub → **Set up**, then either
+**Setting up.** Open `/connect` on the Hub (R4 page → **Connect R4**). It shows a setup code (`WH1:` + base64url JSON `{u, t, ci, cs}`: Hub address, Wheelhouse token, Access client id and secret) and offers it as `hub.txt`. On the R4: Hub → **Set up**, then either
 - **Load hub.txt From Card**: reads `hub.txt` from `Download/` or `Wheelhouse/` and deletes it after loading, or
 - **Paste Setup Code** from the clipboard.
 

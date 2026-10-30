@@ -57,7 +57,7 @@ Keep your existing **HiBy Hub** Access application (email PIN) on `hiby.<your do
    CF_ACCESS_CLIENT_SECRET=<client secret>
    ```
    `sudo systemctl restart hiby-hub`
-4. Open `https://hiby.<your domain>/connect` (Device page → **Connect R4**), download `hub.txt`, copy it to the R4's `Download` folder, and in Wheelhouse choose Hub → Set up → **Load hub.txt From Card**.
+4. Open `https://hiby.<your domain>/connect` (R4 page → **Connect R4**), download `hub.txt`, copy it to the R4's `Download` folder, and in Wheelhouse choose Hub → Set up → **Load hub.txt From Card**.
 
 ## Soulseek downloads → Inbox
 

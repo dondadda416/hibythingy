@@ -30,6 +30,13 @@ function safeName(str) {
   return str.replace(/[\\/:*?"<>|]/g, '_').trim();
 }
 
+// One folder name for the library: no path separators, no leading/trailing
+// dots or spaces (R2 and Windows both dislike those), never "." or "..".
+function cleanSegment(str) {
+  const s = safeName(String(str || '')).replace(/^[.\s]+|[.\s]+$/g, '');
+  return s === '.' || s === '..' ? '' : s.slice(0, 200);
+}
+
 // Recursively copy a directory (needed for cross-drive moves)
 function copyDirSync(src, dst) {
   fs.mkdirSync(dst, { recursive: true });
@@ -44,6 +51,17 @@ function copyDirSync(src, dst) {
 // Delete a directory recursively
 function rmDirSync(dir) {
   fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// After an album leaves the inbox, drop the now-empty Soulseek user folder
+// it sat in (inbox/<user>/<album>), but never the inbox itself.
+function removeEmptyInboxParent(albumPath) {
+  try {
+    const parent = path.dirname(path.resolve(albumPath));
+    if (parent === path.resolve(config.INBOX_PATH)) return;
+    if (!parent.startsWith(path.resolve(config.INBOX_PATH) + path.sep)) return;
+    if (fs.readdirSync(parent).length === 0) fs.rmdirSync(parent);
+  } catch (_) {}
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -249,31 +267,35 @@ router.post('/apply', validateBody(S.TagsApplyBody), (req, res) => {
 // POST /api/tags/move
 // Move a processed inbox folder to the master library on D:
 // Body: { folder, folderPath (optional absolute src) }
-router.post('/move', validateBody(S.TagsMoveBody), (req, res) => {
-  const { folder, folderPath: suppliedPath } = req.body;
+router.post('/move', validateBody(S.TagsMoveBody), async (req, res) => {
+  const { folder, folderPath: suppliedPath, artist, albumFolder } = req.body;
 
   // Source must resolve under INBOX_PATH; destination must resolve under LIBRARY_PATH.
+  // New albums go to <library>/<Artist>/<Album>, matching the rest of the library.
   const srcPath = resolveUnderOrJoin(suppliedPath, folder, [config.INBOX_PATH]);
-  const dstCandidate = path.join(config.LIBRARY_PATH, safeName(folder));
-  const dstPath = resolveUnder(dstCandidate, [config.LIBRARY_PATH]);
+  const artistDir = artist && artist.trim() ? cleanSegment(artist) : '';
+  const albumDir  = cleanSegment(albumFolder || folder);
+  const relPath   = artistDir ? `${artistDir}/${albumDir}` : albumDir;
+  const dstPath   = resolveUnder(path.join(config.LIBRARY_PATH, ...relPath.split('/')), [config.LIBRARY_PATH]);
 
   if (!srcPath || !fs.existsSync(srcPath)) return res.status(404).json({ error: 'Source folder not found' });
-  if (!dstPath) return res.status(400).json({ error: 'Invalid destination path' });
-  if (!fs.existsSync(config.LIBRARY_PATH)) return res.status(500).json({ error: 'Master library path not configured' });
-  if (fs.existsSync(dstPath)) return res.status(409).json({ error: 'A folder with this name already exists in master library.' });
+  if (!dstPath || !albumDir) return res.status(400).json({ error: 'Invalid destination path' });
+  if (!fs.existsSync(config.LIBRARY_PATH)) return res.status(500).json({ error: 'Library path not configured' });
+  if (fs.existsSync(dstPath)) return res.status(409).json({ error: `"${relPath}" already exists in the library.`, relPath });
 
   try {
-    // Try a simple rename first (works when src and dst are on the same drive)
+    await fs.promises.mkdir(path.dirname(dstPath), { recursive: true });
     try {
-      fs.renameSync(srcPath, dstPath);
-    } catch (crossDriveErr) {
-      // Cross-drive: copy then delete
-      copyDirSync(srcPath, dstPath);
-      rmDirSync(srcPath);
+      await fs.promises.rename(srcPath, dstPath);
+    } catch (_) {
+      // Inbox (local disk) -> library (R2 mount): copy, then remove the source.
+      await fs.promises.cp(srcPath, dstPath, { recursive: true, errorOnExist: true, force: false });
+      await fs.promises.rm(srcPath, { recursive: true, force: true });
     }
+    removeEmptyInboxParent(srcPath);
 
-    db.logActivity('move', 'moved-to-library', folder, { from: srcPath, to: dstPath });
-    res.json({ ok: true, movedTo: dstPath, folder });
+    db.logActivity('move', 'moved-to-library', relPath, { from: srcPath, to: dstPath });
+    res.json({ ok: true, movedTo: dstPath, relPath, folder: albumDir });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -526,7 +548,7 @@ router.post('/merge', validateBody(S.TagsMergeBody), (req, res) => {
 
   // Remove the source inbox folder if everything was handled cleanly
   if (errors.length === 0) {
-    try { rmDirSync(srcPath); } catch (_) {}
+    try { rmDirSync(srcPath); removeEmptyInboxParent(srcPath); } catch (_) {}
     db.logActivity('move', 'merged', destFolder, {
       from: srcPath, to: dstPath,
       added: added.length, skipped: skipped.length,

@@ -1,8 +1,8 @@
 'use strict';
 // ── Settings route ──────────────────────────────────────────────────────────
-// In-app editor for the variables that live in .env (and a handful that live
-// in config.js). Reads sanitised values, writes back preserving comments and
-// key order. Path settings are stored as HUB_INBOX_PATH / HUB_LIBRARY_PATH.
+// In-app editor for the few .env values that make sense to change from the
+// dashboard (AI key, Last.fm, contact email). Writes back preserving comments
+// and key order, and applies them to the running server.
 //
 // API keys are masked on read — UI shows last 4 chars + ••••. To rotate, the
 // user supplies a new value; sending an empty string clears the key.
@@ -81,27 +81,23 @@ router.get('/', (req, res) => {
 // Body: any subset of the fields. Empty string clears the value. Returns
 // {ok: true, restartRequired: true} — server keeps running with the OLD
 // values until the next start; the UI nudges the user to restart.
+// The only settings editable from the dashboard. Paths, port, proxy and the
+// Wheelhouse token are fixed by the server setup (deploy/setup.sh), so they're
+// edited in /opt/hiby-hub/.env instead.
+const EDITABLE = {
+  ANTHROPIC_API_KEY:     'ANTHROPIC_API_KEY',
+  ANTHROPIC_MODEL:       'ANTHROPIC_MODEL',
+  DAILY_AI_BUDGET_USD:   null,
+  LASTFM_API_KEY:        'LASTFM_API_KEY',
+  LASTFM_USERNAME:       'LASTFM_USERNAME',
+  HIBYHUB_CONTACT_EMAIL: 'CONTACT_EMAIL',
+};
+
 router.post('/', validateBody(SettingsBody), (req, res) => {
   const body = req.body;
-  // Paths are environment settings too (HUB_INBOX_PATH / HUB_LIBRARY_PATH).
-  const PATH_KEYS = { INBOX_PATH: 'HUB_INBOX_PATH', LIBRARY_PATH: 'HUB_LIBRARY_PATH', DEVICE_NAME: 'DEVICE_NAME' };
-
-  // Everything else lives in .env — apply diff.
   const envUpdates = {};
-  for (const [k, envKey] of Object.entries(PATH_KEYS)) {
-    if (body[k] !== undefined) envUpdates[envKey] = body[k];
-  }
-  for (const k of [
-    'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL', 'LASTFM_API_KEY', 'LASTFM_USERNAME',
-    'HIBYHUB_CONTACT_EMAIL', 'DEVICE_MUSIC_FOLDER', 'DAILY_AI_BUDGET_USD', 'PORT',
-    'HUB_TRUST_PROXY', 'ALLOWED_ORIGINS', 'BASIC_AUTH_USER', 'BASIC_AUTH_PASS',
-    'WHEELHOUSE_TOKEN',
-  ]) {
-    if (Object.prototype.hasOwnProperty.call(body, k)) {
-      // Coerce booleans → "true"/"false" strings so .env stays text-only.
-      const v = body[k];
-      envUpdates[k] = (typeof v === 'boolean') ? String(v) : v;
-    }
+  for (const k of Object.keys(EDITABLE)) {
+    if (Object.prototype.hasOwnProperty.call(body, k)) envUpdates[k] = String(body[k] ?? '').trim();
   }
 
   try {
@@ -114,15 +110,18 @@ router.post('/', validateBody(SettingsBody), (req, res) => {
     return res.status(500).json({ error: 'Save failed: ' + e.message });
   }
 
-  // Log to the activity feed.
+  // Apply straight away; no restart needed.
+  for (const [k, v] of Object.entries(envUpdates)) {
+    process.env[k] = v;
+    if (EDITABLE[k]) config[EDITABLE[k]] = v;
+  }
+  if (envUpdates.ANTHROPIC_MODEL === '') config.ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001';
+
   try {
-    const db = require('../lib/db');
-    db.logActivity('system', 'settings-changed', null, {
-      changedKeys: Object.keys(envUpdates),
-    });
+    require('../lib/db').logActivity('system', 'settings-changed', null, { changedKeys: Object.keys(envUpdates) });
   } catch (_) {}
 
-  res.json({ ok: true, restartRequired: true });
+  res.json({ ok: true, restartRequired: false });
 });
 
 // GET /api/settings/backup — stream the SQLite database file as a download.
