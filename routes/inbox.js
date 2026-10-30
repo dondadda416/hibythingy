@@ -198,9 +198,16 @@ const ACTIVE_DOWNLOAD_EXTS = new Set([
 //   - FOLDER_BIRTH_FRESH: a brand-new folder with too few tracks is almost
 //                         certainly mid-download regardless of mtime; sources
 //                         can stall for hours and still resume.
-const FILE_MTIME_FRESH   = 5  * 60 * 1000;   //  5 min
-const FOLDER_MTIME_FRESH = 30 * 60 * 1000;   // 30 min
-const FOLDER_BIRTH_FRESH = 6  * 60 * 60 * 1000; //  6 h
+//
+// On the cloud server, downloads arrive through the PC relay
+// (scripts/soulseek-push.ps1 every 5 min, deploy/soulseek-pull.sh every
+// 3 min), which only sends finished files and keeps their original times.
+// So the windows are short: one relay round trip, not a Soulseek queue.
+// Override with HUB_INBOX_SETTLE_MINUTES / HUB_INBOX_SPARSE_MINUTES.
+const _envMin = (k, d) => { const n = parseFloat(process.env[k]); return (Number.isFinite(n) && n >= 0 ? n : d) * 60 * 1000; };
+const FILE_MTIME_FRESH   = 5 * 60 * 1000;                                // 5 min
+const FOLDER_MTIME_FRESH = _envMin('HUB_INBOX_SETTLE_MINUTES', 10);     // 10 min
+const FOLDER_BIRTH_FRESH = _envMin('HUB_INBOX_SPARSE_MINUTES', 20);     // 20 min
 
 // Look at a folder and decide if it's still being downloaded into. Returns
 // the reason string for the UI, or null if the folder looks settled.
